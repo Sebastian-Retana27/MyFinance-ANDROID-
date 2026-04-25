@@ -30,7 +30,14 @@ export async function listExpenses(): Promise<Expense[]> {
     amount: number;
     account_name: string;
     created_at: string;
-  }>('SELECT id, description, quantity, amount, account_name, created_at FROM expenses ORDER BY id DESC');
+  }>(
+    `
+      SELECT id, description, quantity, amount, account_name, created_at
+      FROM expenses
+      WHERE COALESCE(is_deleted, 0) = 0
+      ORDER BY id DESC
+    `
+  );
 
   return rows.map((row) => ({
     id: row.id,

@@ -1,4 +1,4 @@
-import { StatusBar } from 'expo-status-bar';
+﻿import { StatusBar } from 'expo-status-bar';
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactElement } from 'react';
 import * as ImagePicker from 'expo-image-picker';
 import {
@@ -9,6 +9,7 @@ import {
   Linking,
   Modal,
   Platform,
+  Share,
   SafeAreaView,
   ScrollView,
   StatusBar as NativeStatusBar,
@@ -19,11 +20,13 @@ import {
   View,
 } from 'react-native';
 import Svg, { Circle, G } from 'react-native-svg';
+import { HorizontalTabs, type HorizontalTabItem } from './src/components/HorizontalTabs';
 import { initDb } from './src/db/database';
 import type { Account } from './src/models/account';
 import type { Expense } from './src/models/expense';
 import type { IncomeEntry } from './src/models/incomeEntry';
 import type { StoredProduct } from './src/models/product';
+import type { Transaction } from './src/models/transaction';
 import {
   createAccount,
   deleteAccountById,
@@ -40,10 +43,18 @@ import {
 } from './src/repositories/categoryColorRepository';
 import { createExpense, listExpenses } from './src/repositories/expenseRepository';
 import { createIncomeEntry, listIncomeEntries } from './src/repositories/incomeRepository';
+import { createAccountMovement } from './src/repositories/accountMovementRepository';
+import { createTransaction, listTransactions } from './src/repositories/transactionRepository';
 import {
   getSavedLanguage,
+  getSavedAppPin,
+  getAppLockEnabled,
+  getHideAmounts,
   getSavedNumberFormat,
   getSavedThemeMode,
+  saveAppLockEnabled,
+  saveAppPin,
+  saveHideAmounts,
   saveNumberFormat,
   saveLanguage,
   saveThemeMode,
@@ -59,7 +70,20 @@ import {
 } from './src/repositories/productRepository';
 import { DEFAULT_PRODUCT_CATEGORIES, FALLBACK_CATEGORY } from './src/services/categoryService';
 import { readTextFromImageLocal } from './src/services/ocrService';
-import { analyzeReceiptText, type ReceiptAnalysis, type ReceiptItem } from './src/services/receiptAnalyzer';
+import {
+  analyzeReceiptText,
+  detectReceiptTotal,
+  extractSemanticReceiptTotal,
+  type ReceiptAnalysis,
+  type ReceiptItem,
+} from './src/services/receiptAnalyzer';
+import {
+  createBackupPayload,
+  restoreBackupPayload,
+  validateBackupPayload,
+  type BackupPayload,
+} from './src/services/backupService';
+import { uiElevation, uiHeight, uiRadius, uiSpacing, uiTypography } from './src/ui/tokens';
 
 type MonthlyProductGroup = {
   monthKey: string;
@@ -75,15 +99,20 @@ type SearchPrediction = {
 type AppSection = 'inicio' | 'gastos' | 'transacciones' | 'cuentas' | 'presupuesto' | 'configuracion';
 type GastosTopTab = 'manual' | 'receipt' | 'transfer' | 'total' | 'income_added';
 type TransferMode = 'received' | 'sent';
+type QuickDateFilter = 'all' | 'today' | '7d' | 'month';
+type TransactionSortField = 'date' | 'amount';
+type SortDirection = 'desc' | 'asc';
 
 const SECTION_SYMBOLS: Record<AppSection, string> = {
-  inicio: '⌂',
-  gastos: '₡',
-  transacciones: '≣',
-  cuentas: '▤',
-  presupuesto: '◔',
-  configuracion: '⚙',
+  inicio: '\u2302',
+  gastos: '\u20A1',
+  transacciones: '\u2263',
+  cuentas: '\u25A4',
+  presupuesto: '\u25D4',
+  configuracion: '\u2699',
 };
+
+const DEV_OCR_DEBUG = false;
 
 type CategorySlice = {
   category: string;
@@ -278,150 +307,12 @@ function parseAmountInput(raw: string): number {
   return Number(normalized);
 }
 
-function parseMoneyToken(raw: string): number {
-  const cleaned = raw.replace(/[^\d.,-]/g, '').trim();
-  if (!cleaned || !/\d/.test(cleaned)) {
-    return Number.NaN;
-  }
-
-  const lastComma = cleaned.lastIndexOf(',');
-  const lastDot = cleaned.lastIndexOf('.');
-
-  if (lastComma === -1 && lastDot === -1) {
-    return Number(cleaned);
-  }
-
-  const decimalIndex = Math.max(lastComma, lastDot);
-  const decimalSeparator = decimalIndex === lastComma ? ',' : '.';
-  const digitsAfter = cleaned.length - decimalIndex - 1;
-
-  if (digitsAfter >= 1 && digitsAfter <= 2) {
-    const integerPart = cleaned.slice(0, decimalIndex).replace(/[.,]/g, '');
-    const decimalPart = cleaned.slice(decimalIndex + 1).replace(/[^\d]/g, '');
-    return Number(`${integerPart}.${decimalPart}`);
-  }
-
-  return Number(cleaned.replace(/[.,]/g, ''));
-}
-
-function extractReceiptTotal(rawText: string): number {
-  const lines = rawText
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter(Boolean);
-
-  const amountPattern = /\$?\s*\d[\d.,]*/g;
-  const extractAmounts = (line: string): number[] =>
-    (line.match(amountPattern) ?? [])
-      .map((token) => parseMoneyToken(token))
-      .filter((value) => Number.isFinite(value) && value > 0);
-
-  const totalCandidates: number[] = [];
-  const totalLikePattern = /\b(total|monto|monto\s+total)\b/i;
-  for (const line of lines) {
-    if (totalLikePattern.test(line)) {
-      totalCandidates.push(...extractAmounts(line));
-    }
-  }
-
-  if (totalCandidates.length > 0) {
-    return Number(Math.max(...totalCandidates).toFixed(2));
-  }
-
-  const allAmounts = lines.flatMap(extractAmounts);
-  if (allAmounts.length === 0) {
-    return 0;
-  }
-
-  return Number(Math.max(...allAmounts).toFixed(2));
-}
-
-function normalizeForLookup(value: string): string {
-  return value
-    .normalize('NFD')
-    .replace(/[\u0300-\u036f]/g, '')
-    .toLowerCase()
-    .trim();
-}
-
-function extractColonesAmounts(line: string): number[] {
-  const colonesPattern = /(?:₡|¢|CRC)\s*[\d][\d.,\s]*/gi;
-  return (line.match(colonesPattern) ?? [])
-    .map((token) => token.replace(/CRC/gi, ''))
-    .map((token) => parseMoneyToken(token))
-    .filter((value) => Number.isFinite(value) && value > 0);
-}
-
-function extractTransferTotal(rawText: string): number {
-  const lines = rawText
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter(Boolean);
-
-  if (lines.length === 0) {
-    return 0;
-  }
-
-  const normalizedLines = lines.map((line) => normalizeForLookup(line));
-  const lineAmounts = lines.map((line) => extractColonesAmounts(line));
-  const ignoredFragments = [
-    'numero de cuenta',
-    'numero de celular',
-    'referencia',
-    'identificacion',
-    'comision',
-    'monto a transferir',
-  ];
-  const candidates: number[] = [];
-
-  for (let i = 0; i < normalizedLines.length; i += 1) {
-    const normalized = normalizedLines[i];
-    const isIgnored = ignoredFragments.some((fragment) => normalized.includes(fragment));
-    if (isIgnored) {
-      continue;
-    }
-
-    if (normalized.includes('monto total') || normalized.includes('total monto')) {
-      candidates.push(...lineAmounts[i]);
-      if (i + 1 < lineAmounts.length) {
-        candidates.push(...lineAmounts[i + 1]);
-      }
-      if (i - 1 >= 0) {
-        candidates.push(...lineAmounts[i - 1]);
-      }
-    }
-  }
-
-  if (candidates.length > 0) {
-    return Number(Math.max(...candidates).toFixed(2));
-  }
-
-  const totalLineCandidates: number[] = [];
-  for (let i = 0; i < normalizedLines.length; i += 1) {
-    const normalized = normalizedLines[i];
-    const looksLikeTotal =
-      normalized.includes('total') &&
-      !normalized.includes('subtotal') &&
-      !ignoredFragments.some((fragment) => normalized.includes(fragment));
-
-    if (looksLikeTotal) {
-      totalLineCandidates.push(...lineAmounts[i]);
-    }
-  }
-
-  if (totalLineCandidates.length > 0) {
-    return Number(Math.max(...totalLineCandidates).toFixed(2));
-  }
-
-  return 0;
-}
-
 function shouldUseUnnamedReceiptFallback(rawText: string, analysis: ReceiptAnalysis): boolean {
   if (analysis.items.length === 0) {
     return true;
   }
 
-  const normalizedText = normalizeForLookup(rawText);
+  const normalizedText = normalizeText(rawText);
   const metadataSignals = [
     'autorizacion',
     'referencia',
@@ -465,7 +356,7 @@ function shouldUseUnnamedReceiptFallback(rawText: string, analysis: ReceiptAnaly
   ];
 
   const hasNamedProduct = analysis.items.some((item) => {
-    const normalizedName = normalizeForLookup(item.name);
+    const normalizedName = normalizeText(item.name);
     if (!normalizedName) {
       return false;
     }
@@ -517,6 +408,59 @@ function getBudgetWarningLevel(budgetAmount: number, spent: number): BudgetWarni
   }
 
   return null;
+}
+
+function hasValidCategory(selectedCategory: string, categories: string[]): boolean {
+  return selectedCategory.trim().length > 0 && categories.includes(selectedCategory);
+}
+
+function isSuspiciousDetectedAmount(value: number): boolean {
+  if (!Number.isFinite(value) || value <= 0) {
+    return true;
+  }
+  return value < 10 || value > 10000000;
+}
+
+function buildMailtoUrl(
+  recipient: string,
+  subject: string,
+  body: string
+): string {
+  const query = `subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
+  return `mailto:${recipient}?${query}`;
+}
+
+function showDangerConfirm(params: {
+  title: string;
+  message: string;
+  cancelText: string;
+  confirmText: string;
+  onConfirm: () => void;
+}) {
+  Alert.alert(params.title, params.message, [
+    { text: params.cancelText, style: 'cancel' },
+    {
+      text: params.confirmText,
+      style: 'destructive',
+      onPress: params.onConfirm,
+    },
+  ]);
+}
+
+function isGenericProductName(value: string): boolean {
+  const normalized = normalizeText(value);
+  if (!normalized) {
+    return true;
+  }
+
+  return (
+    /^producto(\s+\d+)?$/i.test(normalized) ||
+    /^product(\s+\d+)?$/i.test(normalized) ||
+    normalized === 'recibo sin nombre' ||
+    normalized === 'receipt without name' ||
+    normalized === 'item' ||
+    normalized === 'articulo'
+  );
 }
 
 const MONTH_OPTIONS: Record<AppLanguage, { value: string; label: string }[]> = {
@@ -700,7 +644,7 @@ const TEXTS = {
     createAccountFirst: 'Primero crea una cuenta en la seccion Cuentas.',
     bugNotice: '',
     ocrInProgress: '',
-    buildNumber: 'Build Numero 5',
+    buildNumber: 'Build Numero 7',
     language: 'Idioma',
     theme: 'Tema',
     numberFormat: 'Formato numerico',
@@ -798,7 +742,7 @@ const TEXTS = {
     createAccountFirst: 'Create an account first in Accounts section.',
     bugNotice: '',
     ocrInProgress: '',
-    buildNumber: 'Build number 5',
+    buildNumber: 'Build number 7',
     language: 'Language',
     theme: 'Theme',
     numberFormat: 'Number format',
@@ -836,6 +780,26 @@ function getIncomeSourceLabel(source: IncomeEntry['source'], language: AppLangua
   }
 
   return language === 'es' ? 'Ingreso agregado' : 'Added income';
+}
+
+function getTransactionSignedAmount(transaction: Transaction): number {
+  if (transaction.type === 'expense' || transaction.type === 'transfer_out') {
+    return -Math.abs(transaction.amount);
+  }
+  return Math.abs(transaction.amount);
+}
+
+function getTransactionTypeLabel(type: Transaction['type'], language: AppLanguage): string {
+  if (type === 'income') {
+    return language === 'es' ? 'Ingreso' : 'Income';
+  }
+  if (type === 'transfer_in') {
+    return language === 'es' ? 'Transferencia recibida' : 'Transfer received';
+  }
+  if (type === 'transfer_out') {
+    return language === 'es' ? 'Transferencia enviada' : 'Transfer sent';
+  }
+  return language === 'es' ? 'Gasto' : 'Expense';
 }
 
 function normalizeText(value: string): string {
@@ -911,6 +875,11 @@ export default function App() {
   const [language, setLanguage] = useState<AppLanguage>('es');
   const [themeMode, setThemeMode] = useState<AppThemeMode>('dark');
   const [numberFormat, setNumberFormat] = useState<AppNumberFormat>('comma');
+  const [hideAmounts, setHideAmounts] = useState(false);
+  const [appLockEnabled, setAppLockEnabled] = useState(false);
+  const [appPin, setAppPin] = useState('');
+  const [pinInput, setPinInput] = useState('');
+  const [isUnlocked, setIsUnlocked] = useState(true);
   const [description, setDescription] = useState('');
   const [quantity, setQuantity] = useState('1');
   const [amount, setAmount] = useState('');
@@ -942,11 +911,13 @@ export default function App() {
   const [expenses, setExpenses] = useState<Expense[]>([]);
   const [incomeEntries, setIncomeEntries] = useState<IncomeEntry[]>([]);
   const [products, setProducts] = useState<StoredProduct[]>([]);
+  const [transactions, setTransactions] = useState<Transaction[]>([]);
   const [loading, setLoading] = useState(true);
 
   const [receiptImageUri, setReceiptImageUri] = useState<string | null>(null);
   const [ocrText, setOcrText] = useState('');
   const [receiptAnalysis, setReceiptAnalysis] = useState<ReceiptAnalysis | null>(null);
+  const [receiptTotalInput, setReceiptTotalInput] = useState('');
   const [isPickingInvoiceImage, setIsPickingInvoiceImage] = useState(false);
   const [receiptCategory, setReceiptCategory] = useState<string>(FALLBACK_CATEGORY);
   const [selectedReceiptAccountId, setSelectedReceiptAccountId] = useState<number | null>(null);
@@ -954,16 +925,25 @@ export default function App() {
   const [transferImageUri, setTransferImageUri] = useState<string | null>(null);
   const [transferOcrText, setTransferOcrText] = useState('');
   const [transferTotalAmount, setTransferTotalAmount] = useState(0);
+  const [transferTotalInput, setTransferTotalInput] = useState('');
   const [isPickingTransferImage, setIsPickingTransferImage] = useState(false);
   const [selectedTransferAccountId, setSelectedTransferAccountId] = useState<number | null>(null);
   const [activeSection, setActiveSection] = useState<AppSection>('inicio');
   const [gastosTopTab, setGastosTopTab] = useState<GastosTopTab>('manual');
-  const [expenseTabsScrollRatio, setExpenseTabsScrollRatio] = useState(0);
-  const [expenseTabsViewportWidth, setExpenseTabsViewportWidth] = useState(1);
-  const [expenseTabsContentWidth, setExpenseTabsContentWidth] = useState(1);
   const [isDrawerOpen, setIsDrawerOpen] = useState(false);
   const [selectedYear, setSelectedYear] = useState<string>('all');
   const [selectedMonth, setSelectedMonth] = useState<string>('all');
+  const [quickDateFilter, setQuickDateFilter] = useState<QuickDateFilter>('all');
+  const [selectedTransactionAccount, setSelectedTransactionAccount] = useState<string>('all');
+  const [selectedTransactionCategory, setSelectedTransactionCategory] = useState<string>('all');
+  const [transactionSortField, setTransactionSortField] = useState<TransactionSortField>('date');
+  const [transactionSortDirection, setTransactionSortDirection] = useState<SortDirection>('desc');
+  const [internalTransferFromId, setInternalTransferFromId] = useState<number | null>(null);
+  const [internalTransferToId, setInternalTransferToId] = useState<number | null>(null);
+  const [internalTransferAmount, setInternalTransferAmount] = useState('');
+  const [isInternalTransferModalVisible, setIsInternalTransferModalVisible] = useState(false);
+  const [isRestoreBackupModalVisible, setIsRestoreBackupModalVisible] = useState(false);
+  const [backupJsonInput, setBackupJsonInput] = useState('');
   const [productQuery, setProductQuery] = useState('');
   const themeOpacity = useRef(new Animated.Value(1)).current;
   const drawerTranslateX = useRef(new Animated.Value(-280)).current;
@@ -983,6 +963,33 @@ export default function App() {
   const t = TEXTS[language];
   const dateLocale = language === 'es' ? 'es-CR' : 'en-US';
   const monthOptions = MONTH_OPTIONS[language];
+  const confirmGenericNames = useCallback(
+    (count: number): Promise<boolean> =>
+      new Promise((resolve) => {
+        Alert.alert(
+          language === 'es' ? 'Confirmar nombres genericos' : 'Confirm generic names',
+          language === 'es'
+            ? `Se detectaron ${count} producto(s) con nombre generico. ¿Deseas guardarlos de todos modos?`
+            : `${count} product(s) have generic names. Do you want to save them anyway?`,
+          [
+            {
+              text: language === 'es' ? 'Cancelar' : 'Cancel',
+              style: 'cancel',
+              onPress: () => resolve(false),
+            },
+            {
+              text: language === 'es' ? 'Guardar' : 'Save',
+              onPress: () => resolve(true),
+            },
+          ]
+        );
+      }),
+    [language]
+  );
+  const displayCurrency = useCallback(
+    (value: number) => (hideAmounts ? '••••••' : formatCurrency(value, language, numberFormat)),
+    [hideAmounts, language, numberFormat]
+  );
 
   const total = useMemo(() => expenses.reduce((sum, item) => sum + item.amount, 0), [expenses]);
   const totalIncomeAdded = useMemo(
@@ -1030,14 +1037,14 @@ export default function App() {
       const existing = aggregated.get(product.name);
       if (existing) {
         existing.totalUnits += product.quantity;
-        existing.totalAmount = Number((existing.totalAmount + product.unitPrice).toFixed(2));
+        existing.totalAmount = Number((existing.totalAmount + product.lineTotal).toFixed(2));
         continue;
       }
 
       aggregated.set(product.name, {
         name: product.name,
         totalUnits: product.quantity,
-        totalAmount: Number(product.unitPrice.toFixed(2)),
+        totalAmount: Number(product.lineTotal.toFixed(2)),
       });
     }
 
@@ -1060,6 +1067,121 @@ export default function App() {
       ),
     [currentMonthProducts]
   );
+
+  const previousMonthTotal = useMemo(() => {
+    const nowDate = new Date();
+    const previousMonthDate = new Date(nowDate.getFullYear(), nowDate.getMonth() - 1, 1);
+    return Number(
+      products
+        .filter((product) => {
+          const date = new Date(product.createdAt);
+          return (
+            date.getFullYear() === previousMonthDate.getFullYear() &&
+            date.getMonth() === previousMonthDate.getMonth()
+          );
+        })
+        .reduce((sum, product) => sum + product.lineTotal, 0)
+        .toFixed(2)
+    );
+  }, [products]);
+
+  const topCategoryThisMonth = useMemo(() => {
+    const totals = new Map<string, number>();
+    for (const item of currentMonthProducts) {
+      const prev = totals.get(item.category) ?? 0;
+      totals.set(item.category, Number((prev + item.lineTotal).toFixed(2)));
+    }
+    const sorted = Array.from(totals.entries()).sort((a, b) => b[1] - a[1]);
+    if (sorted.length === 0) {
+      return null;
+    }
+    return { category: sorted[0][0], total: sorted[0][1] };
+  }, [currentMonthProducts]);
+
+  const currentMonthTransactions = useMemo(() => {
+    const currentYear = now.getFullYear();
+    const currentMonth = now.getMonth();
+    return transactions.filter((transaction) => {
+      const date = new Date(transaction.createdAt);
+      return date.getFullYear() === currentYear && date.getMonth() === currentMonth;
+    });
+  }, [now, transactions]);
+
+  const currentMonthIncomeTotal = useMemo(
+    () =>
+      Number(
+        currentMonthTransactions
+          .filter((transaction) => transaction.type === 'income' || transaction.type === 'transfer_in')
+          .reduce((sum, transaction) => sum + transaction.amount, 0)
+          .toFixed(2)
+      ),
+    [currentMonthTransactions]
+  );
+
+  const currentMonthExpenseTotal = useMemo(
+    () =>
+      Number(
+        currentMonthTransactions
+          .filter((transaction) => transaction.type === 'expense' || transaction.type === 'transfer_out')
+          .reduce((sum, transaction) => sum + transaction.amount, 0)
+          .toFixed(2)
+      ),
+    [currentMonthTransactions]
+  );
+
+  const currentMonthBalance = useMemo(
+    () => Number((currentMonthIncomeTotal - currentMonthExpenseTotal).toFixed(2)),
+    [currentMonthExpenseTotal, currentMonthIncomeTotal]
+  );
+
+  const topProductThisMonth = useMemo<TopVariosProduct | null>(() => {
+    if (currentMonthProducts.length === 0) {
+      return null;
+    }
+
+    const aggregated = new Map<string, TopVariosProduct>();
+    for (const product of currentMonthProducts) {
+      const existing = aggregated.get(product.name);
+      if (existing) {
+        existing.totalUnits += product.quantity;
+        existing.totalAmount = Number((existing.totalAmount + product.lineTotal).toFixed(2));
+        continue;
+      }
+      aggregated.set(product.name, {
+        name: product.name,
+        totalUnits: product.quantity,
+        totalAmount: Number(product.lineTotal.toFixed(2)),
+      });
+    }
+
+    return Array.from(aggregated.values()).sort((a, b) => {
+      if (b.totalUnits !== a.totalUnits) {
+        return b.totalUnits - a.totalUnits;
+      }
+      return b.totalAmount - a.totalAmount;
+    })[0];
+  }, [currentMonthProducts]);
+
+  const topMovementAccountThisMonth = useMemo(() => {
+    const movementByAccount = new Map<string, number>();
+    for (const transaction of currentMonthTransactions) {
+      const accountName = transaction.accountName?.trim();
+      if (!accountName) {
+        continue;
+      }
+      const prev = movementByAccount.get(accountName) ?? 0;
+      movementByAccount.set(
+        accountName,
+        Number((prev + Math.abs(transaction.amount)).toFixed(2))
+      );
+    }
+
+    const sorted = Array.from(movementByAccount.entries()).sort((a, b) => b[1] - a[1]);
+    if (sorted.length === 0) {
+      return null;
+    }
+    return { accountName: sorted[0][0], amount: sorted[0][1] };
+  }, [currentMonthTransactions]);
 
   const availableCategories = useMemo(() => {
     const fromProducts = currentMonthProducts.map((product) => product.category);
@@ -1145,16 +1267,41 @@ export default function App() {
   }, [normalizedQuery, uniqueProductNames]);
 
   const filteredProducts = useMemo(() => {
-    return products.filter((product) => {
+    const filtered = products.filter((product) => {
       const date = new Date(product.createdAt);
       const productYear = String(date.getFullYear());
       const productMonth = String(date.getMonth() + 1).padStart(2, '0');
+      const nowDate = new Date();
+      const startOfToday = new Date(nowDate.getFullYear(), nowDate.getMonth(), nowDate.getDate());
+      const startOfMonth = new Date(nowDate.getFullYear(), nowDate.getMonth(), 1);
+      const sevenDaysAgo = new Date(startOfToday);
+      sevenDaysAgo.setDate(startOfToday.getDate() - 6);
+
+      if (quickDateFilter === 'today' && date < startOfToday) {
+        return false;
+      }
+
+      if (quickDateFilter === '7d' && date < sevenDaysAgo) {
+        return false;
+      }
+
+      if (quickDateFilter === 'month' && date < startOfMonth) {
+        return false;
+      }
 
       if (selectedYear !== 'all' && productYear !== selectedYear) {
         return false;
       }
 
       if (selectedMonth !== 'all' && productMonth !== selectedMonth) {
+        return false;
+      }
+
+      if (selectedTransactionAccount !== 'all' && product.accountName !== selectedTransactionAccount) {
+        return false;
+      }
+
+      if (selectedTransactionCategory !== 'all' && product.category !== selectedTransactionCategory) {
         return false;
       }
 
@@ -1165,7 +1312,69 @@ export default function App() {
       const score = getFuzzyScore(normalizedQuery, normalizeText(product.name));
       return score >= 0.35;
     });
-  }, [normalizedQuery, products, selectedMonth, selectedYear]);
+
+    const directionFactor = transactionSortDirection === 'asc' ? 1 : -1;
+    filtered.sort((a, b) => {
+      if (transactionSortField === 'amount') {
+        const amountCompare = (a.lineTotal - b.lineTotal) * directionFactor;
+        if (amountCompare !== 0) {
+          return amountCompare;
+        }
+      }
+
+      const dateCompare =
+        (new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime()) * directionFactor;
+      if (dateCompare !== 0) {
+        return dateCompare;
+      }
+
+      return (a.id - b.id) * directionFactor;
+    });
+
+    return filtered;
+  }, [normalizedQuery, products, quickDateFilter, selectedMonth, selectedTransactionAccount, selectedTransactionCategory, selectedYear, transactionSortDirection, transactionSortField]);
+
+  const filteredTransactions = useMemo(() => {
+    const nowDate = new Date();
+    const startOfToday = new Date(nowDate.getFullYear(), nowDate.getMonth(), nowDate.getDate());
+    const startOfMonth = new Date(nowDate.getFullYear(), nowDate.getMonth(), 1);
+    const sevenDaysAgo = new Date(startOfToday);
+    sevenDaysAgo.setDate(startOfToday.getDate() - 6);
+
+    const filtered = transactions.filter((transaction) => {
+      const date = new Date(transaction.createdAt);
+      if (quickDateFilter === 'today' && date < startOfToday) {
+        return false;
+      }
+      if (quickDateFilter === '7d' && date < sevenDaysAgo) {
+        return false;
+      }
+      if (quickDateFilter === 'month' && date < startOfMonth) {
+        return false;
+      }
+      return true;
+    });
+
+    filtered.sort((a, b) => {
+      if (transactionSortField === 'amount') {
+        const amountFactor = transactionSortDirection === 'desc' ? -1 : 1;
+        const amountCompare = (a.amount - b.amount) * amountFactor;
+        if (amountCompare !== 0) {
+          return amountCompare;
+        }
+      }
+
+      const dateFactor = transactionSortDirection === 'desc' ? -1 : 1;
+      const dateCompare = (new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime()) * dateFactor;
+      if (dateCompare !== 0) {
+        return dateCompare;
+      }
+
+      return (a.id - b.id) * dateFactor;
+    });
+
+    return filtered;
+  }, [quickDateFilter, transactionSortDirection, transactionSortField, transactions]);
 
   const groupedProducts = useMemo<MonthlyProductGroup[]>(() => {
     const groupMap = new Map<string, MonthlyProductGroup>();
@@ -1204,6 +1413,11 @@ export default function App() {
     setProducts(data);
   }, []);
 
+  const loadTransactions = useCallback(async () => {
+    const data = await listTransactions();
+    setTransactions(data);
+  }, []);
+
   const loadCategories = useCallback(async () => {
     const data = await listCategories();
     setCategories(data);
@@ -1224,6 +1438,18 @@ export default function App() {
     setNumberFormat(saved);
   }, []);
 
+  const loadPrivacySettings = useCallback(async () => {
+    const [hide, lockEnabled, savedPin] = await Promise.all([
+      getHideAmounts(),
+      getAppLockEnabled(),
+      getSavedAppPin(),
+    ]);
+    setHideAmounts(hide);
+    setAppLockEnabled(lockEnabled);
+    setAppPin(savedPin);
+    setIsUnlocked(!(lockEnabled && savedPin.length >= 4));
+  }, []);
+
   const loadAccounts = useCallback(async () => {
     const data = await listAccounts();
     setAccounts(data);
@@ -1239,21 +1465,29 @@ export default function App() {
     setCategoryColors(data);
   }, []);
 
+  const reloadAllData = useCallback(async () => {
+    await Promise.all([
+      loadExpenses(),
+      loadIncomeEntries(),
+      loadProducts(),
+      loadTransactions(),
+      loadCategories(),
+      loadAccounts(),
+      loadBudgets(),
+      loadCategoryColors(),
+    ]);
+  }, [loadAccounts, loadBudgets, loadCategories, loadCategoryColors, loadExpenses, loadIncomeEntries, loadProducts, loadTransactions]);
+
   useEffect(() => {
     (async () => {
       try {
         await initDb();
         await Promise.all([
-          loadExpenses(),
-          loadIncomeEntries(),
-          loadProducts(),
-          loadCategories(),
-          loadAccounts(),
+          reloadAllData(),
           loadLanguage(),
           loadThemeMode(),
           loadNumberFormat(),
-          loadBudgets(),
-          loadCategoryColors(),
+          loadPrivacySettings(),
         ]);
       } catch (error) {
         Alert.alert(language === 'es' ? 'Error' : 'Error', error instanceof Error ? error.message : language === 'es' ? 'No se pudo iniciar la app' : 'Could not start the app');
@@ -1261,7 +1495,7 @@ export default function App() {
         setLoading(false);
       }
     })();
-  }, [loadAccounts, loadBudgets, loadCategories, loadCategoryColors, loadExpenses, loadIncomeEntries, loadLanguage, loadNumberFormat, loadProducts, loadThemeMode]);
+  }, [loadLanguage, loadNumberFormat, loadPrivacySettings, loadThemeMode, reloadAllData]);
 
   useEffect(() => {
     if (categories.length > 0 && !categories.includes(manualCategory)) {
@@ -1296,6 +1530,8 @@ export default function App() {
       setSelectedExpenseAccountId(null);
       setSelectedReceiptAccountId(null);
       setSelectedTransferAccountId(null);
+      setInternalTransferFromId(null);
+      setInternalTransferToId(null);
       return;
     }
 
@@ -1308,7 +1544,13 @@ export default function App() {
     if (!accounts.some((account) => account.id === selectedTransferAccountId)) {
       setSelectedTransferAccountId(accounts[0].id);
     }
-  }, [accounts, selectedExpenseAccountId, selectedReceiptAccountId, selectedTransferAccountId]);
+    if (!accounts.some((account) => account.id === internalTransferFromId)) {
+      setInternalTransferFromId(accounts[0].id);
+    }
+    if (!accounts.some((account) => account.id === internalTransferToId)) {
+      setInternalTransferToId(accounts.length > 1 ? accounts[1].id : accounts[0].id);
+    }
+  }, [accounts, internalTransferFromId, internalTransferToId, selectedExpenseAccountId, selectedReceiptAccountId, selectedTransferAccountId]);
 
   useEffect(() => {
     const monthKey = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
@@ -1411,6 +1653,23 @@ export default function App() {
       return;
     }
 
+    if (isGenericProductName(normalizedDescription)) {
+      const confirmed = await confirmGenericNames(1);
+      if (!confirmed) {
+        return;
+      }
+    }
+
+    if (!hasValidCategory(manualCategory, categories)) {
+      Alert.alert(
+        language === 'es' ? 'Categoria requerida' : 'Category required',
+        language === 'es'
+          ? 'Selecciona una categoria valida para guardar el gasto.'
+          : 'Select a valid category to save the expense.'
+      );
+      return;
+    }
+
     if (selectedExpenseAccountId == null) {
       Alert.alert(
         language === 'es' ? 'Cuenta requerida' : 'Account required',
@@ -1458,11 +1717,26 @@ export default function App() {
         selectedAccount.name
       );
       await updateAccountBalance(selectedAccount.id, Number((selectedAccount.balance - manualLineTotal).toFixed(2)));
+      await createAccountMovement({
+        type: 'expense_manual',
+        amount: -manualLineTotal,
+        accountName: selectedAccount.name,
+        note: normalizedDescription,
+      });
+      await createTransaction({
+        type: 'expense',
+        source: 'manual_expense',
+        amount: manualLineTotal,
+        quantity: parsedQuantity,
+        category: manualCategory,
+        accountName: selectedAccount.name,
+        note: normalizedDescription,
+      });
       setDescription('');
       setQuantity('1');
       setAmount('');
       setManualCategory(FALLBACK_CATEGORY);
-      await Promise.all([loadExpenses(), loadProducts(), loadAccounts()]);
+      await Promise.all([loadExpenses(), loadProducts(), loadAccounts(), loadTransactions()]);
     } catch (error) {
       Alert.alert(language === 'es' ? 'Error' : 'Error', error instanceof Error ? error.message : language === 'es' ? 'No se pudo guardar el gasto' : 'Could not save expense');
     }
@@ -1504,6 +1778,7 @@ export default function App() {
       setReceiptImageUri(imageUri);
       setOcrText('');
       setReceiptAnalysis(null);
+      setReceiptTotalInput('');
 
       try {
         const ocrResult = await readTextFromImageLocal(imageUri);
@@ -1527,12 +1802,31 @@ export default function App() {
 
   const onAnalyzeReceipt = () => {
     const analysis = analyzeReceiptText(ocrText);
-    const fallbackTotal = extractReceiptTotal(ocrText);
+    const fallbackTotal = analysis.detectedTotal?.amount ?? extractSemanticReceiptTotal(ocrText);
     const useUnnamedFallback =
       fallbackTotal > 0 && shouldUseUnnamedReceiptFallback(ocrText, analysis);
+    const noTotalMessage =
+      language === 'es'
+        ? 'No pude detectar el total del recibo. Revisa el texto o ingrésalo manualmente.'
+        : 'I could not detect the receipt total. Review the text or enter it manually.';
+    const noProductsMessage =
+      language === 'es'
+        ? 'No pude detectar productos claros. Puedes editar el texto escaneado o registrar el gasto manualmente.'
+        : 'I could not detect clear products. You can edit scanned text or register the expense manually.';
 
     if (analysis.items.length > 0 && !useUnnamedFallback) {
       setReceiptAnalysis(analysis);
+      const suggestedTotal =
+        analysis.detectedTotal && analysis.detectedTotal.confidence >= 0.75
+          ? analysis.detectedTotal.amount
+          : analysis.totalAmount;
+      setReceiptTotalInput(suggestedTotal > 0 ? suggestedTotal.toFixed(2) : '');
+      if (analysis.warnings.length > 0) {
+        Alert.alert(
+          language === 'es' ? 'Revision recomendada' : 'Review recommended',
+          analysis.warnings.join('\n')
+        );
+      }
       return;
     }
 
@@ -1548,33 +1842,127 @@ export default function App() {
         items: [fallbackItem],
         totalAmount: fallbackTotal,
         totalUnits: 1,
+        detectedTotal: analysis.detectedTotal,
+        warnings: analysis.warnings,
+        rawLines: analysis.rawLines,
       });
+      setReceiptTotalInput(fallbackTotal.toFixed(2));
 
       Alert.alert(
         language === 'es' ? 'Solo total detectado' : 'Only total detected',
-        language === 'es'
-          ? 'No se detectaron productos con nombre. Se usara unicamente el monto como "Recibo sin nombre".'
-          : 'No named products were detected. Only the amount will be saved as "Recibo sin nombre".'
+        noProductsMessage
       );
       return;
     }
 
-    setReceiptAnalysis(null);
+    setReceiptAnalysis({
+      items: [],
+      totalAmount: 0,
+      totalUnits: 0,
+      detectedTotal: analysis.detectedTotal,
+      warnings: [
+        noTotalMessage,
+        noProductsMessage,
+      ],
+      rawLines: analysis.rawLines,
+      debug: analysis.debug,
+    });
     Alert.alert(
-      language === 'es' ? 'Sin productos detectados' : 'No products detected',
-      language === 'es'
-        ? 'No se detectaron lineas de productos ni total. Corrige o pega el texto de la imagen y reintenta.'
-        : 'No product lines or total were detected. Fix or paste image text and try again.'
+      language === 'es' ? 'Revisión manual recomendada' : 'Manual review recommended',
+      `${noTotalMessage}\n\n${noProductsMessage}`
     );
   };
 
   const onSaveDetectedProducts = async () => {
-    if (!receiptAnalysis || receiptAnalysis.items.length === 0) {
+    if (!receiptAnalysis) {
       Alert.alert(
         language === 'es' ? 'Sin datos' : 'No data',
         language === 'es'
           ? 'Primero analiza la factura para obtener productos.'
           : 'Analyze the receipt first to get products.'
+      );
+      return;
+    }
+
+    const parsedReceiptTotalInput = parseAmountInput(receiptTotalInput);
+    const detectedTotalCandidate =
+      receiptAnalysis.detectedTotal && receiptAnalysis.detectedTotal.confidence >= 0.75
+        ? receiptAnalysis.detectedTotal.amount
+        : 0;
+    const manualOrDetectedTotal = Number(
+      (
+        Number.isFinite(parsedReceiptTotalInput) && parsedReceiptTotalInput > 0
+          ? parsedReceiptTotalInput
+          : detectedTotalCandidate > 0
+            ? detectedTotalCandidate
+            : receiptAnalysis.totalAmount
+      ).toFixed(2)
+    );
+
+    const normalizedItemsSource =
+      receiptAnalysis.items.length > 0
+        ? receiptAnalysis.items
+        : [
+            {
+              name: 'Recibo sin nombre',
+              quantity: 1,
+              unitPrice: manualOrDetectedTotal,
+              lineTotal: manualOrDetectedTotal,
+            } satisfies ReceiptItem,
+          ];
+
+    const normalizedItems = normalizedItemsSource.map((item) => ({
+      ...item,
+      name: item.name.trim(),
+      quantity: Number(item.quantity),
+      unitPrice: Number(item.unitPrice),
+      lineTotal: Number(item.lineTotal),
+    }));
+
+    const emptyNameFound = normalizedItems.some((item) => item.name.length === 0);
+    if (emptyNameFound) {
+      Alert.alert(
+        language === 'es' ? 'Producto invalido' : 'Invalid product',
+        language === 'es'
+          ? 'Hay productos sin nombre. Corrige los nombres antes de guardar.'
+          : 'Some products have empty names. Fix names before saving.'
+      );
+      return;
+    }
+
+    const invalidNumbersFound = normalizedItems.some(
+      (item) =>
+        !Number.isFinite(item.quantity) ||
+        item.quantity <= 0 ||
+        !Number.isFinite(item.unitPrice) ||
+        item.unitPrice <= 0 ||
+        !Number.isFinite(item.lineTotal) ||
+        item.lineTotal <= 0
+    );
+    if (invalidNumbersFound) {
+      Alert.alert(
+        language === 'es' ? 'Datos invalidos' : 'Invalid data',
+        language === 'es'
+          ? 'Cada producto debe tener cantidad, precio unitario y total por linea mayores que 0.'
+          : 'Each product must have quantity, unit price and line total greater than 0.'
+      );
+      return;
+    }
+
+    const genericCount = normalizedItems.filter((item) => isGenericProductName(item.name)).length;
+    if (genericCount > 0) {
+      const confirmed = await confirmGenericNames(genericCount);
+      if (!confirmed) {
+        return;
+      }
+    }
+
+    if (!hasValidCategory(receiptCategory, categories)) {
+      Alert.alert(
+        language === 'es' ? 'Categoria requerida' : 'Category required',
+        language === 'es'
+          ? 'Selecciona una categoria valida antes de guardar los productos detectados.'
+          : 'Select a valid category before saving detected products.'
       );
       return;
     }
@@ -1598,15 +1986,45 @@ export default function App() {
       return;
     }
 
-    const receiptTotal = Number(receiptAnalysis.totalAmount.toFixed(2));
+    const itemsComputedTotal = Number(
+      normalizedItems.reduce((sum, item) => sum + item.lineTotal, 0).toFixed(2)
+    );
+    const receiptTotal = Number(
+      (Number.isFinite(parsedReceiptTotalInput) && parsedReceiptTotalInput > 0
+        ? parsedReceiptTotalInput
+        : detectedTotalCandidate > 0
+          ? detectedTotalCandidate
+          : itemsComputedTotal > 0
+            ? itemsComputedTotal
+            : receiptAnalysis.totalAmount
+      ).toFixed(2)
+    );
     if (receiptTotal <= 0) {
       Alert.alert(
         language === 'es' ? 'Sin datos' : 'No data',
         language === 'es'
-          ? 'No se detecto un monto valido en la captura.'
-          : 'No valid amount was detected in the capture.'
+          ? 'No se detecto un total valido en la captura. Corrige el texto OCR y vuelve a analizar.'
+          : 'No valid total amount was detected in the capture. Fix OCR text and analyze again.'
       );
       return;
+    }
+
+    if (Math.abs(receiptTotal - receiptAnalysis.totalAmount) > 0.01) {
+      Alert.alert(
+        language === 'es' ? 'Total ajustado' : 'Adjusted total',
+        language === 'es'
+          ? `Se guardara el total editado (${displayCurrency(receiptTotal)}) en lugar del total detectado (${displayCurrency(receiptAnalysis.totalAmount)}).`
+          : `Edited total (${displayCurrency(receiptTotal)}) will be used instead of detected total (${displayCurrency(receiptAnalysis.totalAmount)}).`
+      );
+    }
+
+    if (isSuspiciousDetectedAmount(receiptTotal)) {
+      Alert.alert(
+        language === 'es' ? 'Revision recomendada' : 'Review recommended',
+        language === 'es'
+          ? 'El monto detectado parece inusual. Revisa la captura o corrige el total antes de guardar.'
+          : 'Detected amount looks unusual. Review the image or edit total before saving.'
+      );
     }
 
     if (selectedAccount.balance < receiptTotal) {
@@ -1628,7 +2046,16 @@ export default function App() {
     }
 
     try {
-      await createProducts(receiptAnalysis.items, {
+      const itemsToSave =
+        normalizedItems.length === 1
+          ? normalizedItems.map((item) => ({
+              ...item,
+              unitPrice: receiptTotal,
+              lineTotal: receiptTotal,
+            }))
+          : normalizedItems;
+
+      await createProducts(itemsToSave, {
         categoryOverride: receiptCategory,
         accountName: selectedAccount.name,
       });
@@ -1636,12 +2063,27 @@ export default function App() {
         selectedAccount.id,
         Number((selectedAccount.balance - receiptTotal).toFixed(2))
       );
-      await Promise.all([loadProducts(), loadAccounts()]);
+      await createAccountMovement({
+        type: 'expense_receipt',
+        amount: -receiptTotal,
+        accountName: selectedAccount.name,
+        note: `Receipt items: ${normalizedItems.length}`,
+      });
+      await createTransaction({
+        type: 'expense',
+        source: 'receipt_capture',
+        amount: receiptTotal,
+        quantity: normalizedItems.reduce((sum, item) => sum + item.quantity, 0),
+        category: receiptCategory,
+        accountName: selectedAccount.name,
+        note: `Receipt items: ${normalizedItems.length}`,
+      });
+      await Promise.all([loadProducts(), loadAccounts(), loadTransactions()]);
       Alert.alert(
         language === 'es' ? 'Guardado' : 'Saved',
         language === 'es'
-          ? `${receiptAnalysis.items.length} productos agregados.`
-          : `${receiptAnalysis.items.length} products added.`
+          ? `${normalizedItems.length} productos agregados.`
+          : `${normalizedItems.length} products added.`
       );
     } catch (error) {
       Alert.alert(language === 'es' ? 'Error' : 'Error', error instanceof Error ? error.message : language === 'es' ? 'No se pudieron guardar los productos' : 'Could not save products');
@@ -1652,12 +2094,14 @@ export default function App() {
     setReceiptImageUri(null);
     setOcrText('');
     setReceiptAnalysis(null);
+    setReceiptTotalInput('');
   };
 
   const onClearTransferCapture = () => {
     setTransferImageUri(null);
     setTransferOcrText('');
     setTransferTotalAmount(0);
+    setTransferTotalInput('');
   };
 
   const onPickTransferScreenshot = async () => {
@@ -1696,12 +2140,15 @@ export default function App() {
       setTransferImageUri(imageUri);
       setTransferOcrText('');
       setTransferTotalAmount(0);
+      setTransferTotalInput('');
 
       try {
         const ocrResult = await readTextFromImageLocal(imageUri);
         setTransferOcrText(ocrResult.text);
-        const autoDetectedTotal = extractTransferTotal(ocrResult.text);
+        const transferDetected = detectReceiptTotal(ocrResult.text);
+        const autoDetectedTotal = transferDetected?.amount ?? 0;
         setTransferTotalAmount(autoDetectedTotal);
+        setTransferTotalInput(autoDetectedTotal > 0 ? autoDetectedTotal.toFixed(2) : '');
       } catch (error) {
         Alert.alert(
           language === 'es' ? 'Lectura de transferencia' : 'Transfer reading',
@@ -1720,8 +2167,10 @@ export default function App() {
   };
 
   const onAnalyzeTransferTotal = () => {
-    const detectedTotal = extractTransferTotal(transferOcrText);
+    const detected = detectReceiptTotal(transferOcrText);
+    const detectedTotal = detected?.amount ?? 0;
     setTransferTotalAmount(detectedTotal);
+    setTransferTotalInput(detectedTotal > 0 ? detectedTotal.toFixed(2) : '');
 
     if (detectedTotal > 0) {
       return;
@@ -1730,8 +2179,8 @@ export default function App() {
     Alert.alert(
       language === 'es' ? 'Sin monto total detectado' : 'No total amount detected',
       language === 'es'
-        ? 'No se detecto "Monto total" con simbolo de colones en la captura. Corrige el texto OCR y reintenta.'
-        : 'Could not detect "Total amount" with CRC symbol in the capture. Fix OCR text and retry.'
+        ? 'No se detecto "Monto total" con simbolo de colones (₡/CRC). Corrige el texto OCR y reintenta.'
+        : 'Could not detect "Total amount" with CRC symbol (₡/CRC). Fix OCR text and retry.'
     );
   };
 
@@ -1765,15 +2214,30 @@ export default function App() {
       return;
     }
 
-    const totalToApply = Number(transferTotalAmount.toFixed(2));
+    const parsedTransferInput = parseAmountInput(transferTotalInput);
+    const totalToApply = Number(
+      (Number.isFinite(parsedTransferInput) && parsedTransferInput > 0
+        ? parsedTransferInput
+        : transferTotalAmount
+      ).toFixed(2)
+    );
     if (!Number.isFinite(totalToApply) || totalToApply <= 0) {
       Alert.alert(
         language === 'es' ? 'Monto invalido' : 'Invalid amount',
         language === 'es'
-          ? 'No se detecto un "Monto total" valido en la captura.'
-          : 'No valid "Total amount" was detected in the capture.'
+          ? 'No se detecto un "Monto total" valido. Usa "Detectar monto total" y valida el texto OCR.'
+          : 'No valid "Total amount" was detected. Use "Detect total amount" and verify OCR text.'
       );
       return;
+    }
+
+    if (isSuspiciousDetectedAmount(totalToApply)) {
+      Alert.alert(
+        language === 'es' ? 'Revision recomendada' : 'Review recommended',
+        language === 'es'
+          ? 'El monto detectado parece inusual. Verifica el valor antes de aplicarlo.'
+          : 'Detected amount looks unusual. Verify it before applying.'
+      );
     }
 
     if (transferMode === 'sent' && selectedAccount.balance < totalToApply) {
@@ -1803,9 +2267,37 @@ export default function App() {
       await updateAccountBalance(selectedAccount.id, nextBalance);
       if (transferMode === 'received') {
         await createIncomeEntry('transfer_received', totalToApply, selectedAccount.name);
-        await Promise.all([loadAccounts(), loadIncomeEntries()]);
+        await createAccountMovement({
+          type: 'transfer_in',
+          amount: totalToApply,
+          accountName: selectedAccount.name,
+          note: 'Transfer received',
+        });
+        await createTransaction({
+          type: 'transfer_in',
+          source: 'transfer_capture',
+          amount: totalToApply,
+          category: FALLBACK_CATEGORY,
+          accountName: selectedAccount.name,
+          note: 'Transfer received',
+        });
+        await Promise.all([loadAccounts(), loadIncomeEntries(), loadTransactions()]);
       } else {
-        await loadAccounts();
+        await createAccountMovement({
+          type: 'transfer_out',
+          amount: -totalToApply,
+          accountName: selectedAccount.name,
+          note: 'Transfer sent',
+        });
+        await createTransaction({
+          type: 'transfer_out',
+          source: 'transfer_capture',
+          amount: totalToApply,
+          category: FALLBACK_CATEGORY,
+          accountName: selectedAccount.name,
+          note: 'Transfer sent',
+        });
+        await Promise.all([loadAccounts(), loadTransactions()]);
       }
       Alert.alert(
         language === 'es' ? 'Transferencia aplicada' : 'Transfer applied',
@@ -1835,27 +2327,74 @@ export default function App() {
   };
 
   const onClearFilters = () => {
+    setQuickDateFilter('all');
     setSelectedYear('all');
     setSelectedMonth('all');
+    setSelectedTransactionAccount('all');
+    setSelectedTransactionCategory('all');
+    setTransactionSortField('date');
+    setTransactionSortDirection('desc');
     setProductQuery('');
   };
 
-  const onDeleteProduct = (productId: number) => {
-    Alert.alert(language === 'es' ? 'Eliminar producto' : 'Delete product', language === 'es' ? 'Este producto se eliminara de la lista. ¿Deseas continuar?' : 'This product will be removed from the list. Continue?', [
-      { text: language === 'es' ? 'Cancelar' : 'Cancel', style: 'cancel' },
-      {
-        text: language === 'es' ? 'Eliminar' : 'Delete',
-        style: 'destructive',
-        onPress: async () => {
-          try {
-            await deleteProductById(productId);
-            await loadProducts();
-          } catch (error) {
-            Alert.alert(language === 'es' ? 'Error' : 'Error', error instanceof Error ? error.message : language === 'es' ? 'No se pudo eliminar el producto' : 'Could not delete product');
-          }
-        },
-      },
+  const onExportTransactionsCsv = async () => {
+    if (filteredTransactions.length === 0) {
+      Alert.alert(
+        language === 'es' ? 'Sin datos' : 'No data',
+        language === 'es'
+          ? 'No hay transacciones para exportar con los filtros actuales.'
+          : 'There are no transactions to export with current filters.'
+      );
+      return;
+    }
+
+    const header = ['date', 'type', 'source', 'category', 'account', 'quantity', 'amount', 'note'];
+    const rows = filteredTransactions.map((item) => [
+      item.createdAt,
+      item.type,
+      item.source,
+      item.category,
+      item.accountName || '',
+      String(item.quantity ?? 1),
+      item.amount.toFixed(2),
+      item.note || '',
     ]);
+
+    const csv = [header, ...rows]
+      .map((row) =>
+        row
+          .map((cell) => {
+            const safe = `${cell}`.replace(/"/g, '""');
+            return `"${safe}"`;
+          })
+          .join(',')
+      )
+      .join('\n');
+
+    await Share.share({
+      title: 'MyFinance CSV',
+      message: csv,
+    });
+  };
+
+  const onDeleteProduct = (productId: number) => {
+    showDangerConfirm({
+      title: language === 'es' ? 'Eliminar producto' : 'Delete product',
+      message:
+        language === 'es'
+          ? 'Este producto se ocultara del historial visible. ¿Deseas continuar?'
+          : 'This product will be removed from visible history. Continue?',
+      cancelText: language === 'es' ? 'Cancelar' : 'Cancel',
+      confirmText: language === 'es' ? 'Eliminar' : 'Delete',
+      onConfirm: async () => {
+        try {
+          await deleteProductById(productId);
+          await loadProducts();
+        } catch (error) {
+          Alert.alert(language === 'es' ? 'Error' : 'Error', error instanceof Error ? error.message : language === 'es' ? 'No se pudo eliminar el producto' : 'Could not delete product');
+        }
+      },
+    });
   };
 
   const onAddCategory = async () => {
@@ -1884,28 +2423,24 @@ export default function App() {
       return;
     }
 
-    Alert.alert(
-      language === 'es' ? 'Eliminar categoria' : 'Delete category',
-      language === 'es'
-        ? `Se eliminara "${manualCategory}" y sus productos pasaran a "varios".`
-        : `"${manualCategory}" will be deleted and its products moved to "varios".`,
-      [
-      { text: language === 'es' ? 'Cancelar' : 'Cancel', style: 'cancel' },
-      {
-        text: language === 'es' ? 'Eliminar' : 'Delete',
-        style: 'destructive',
-        onPress: async () => {
-          try {
-            await deleteCategory(manualCategory);
-            await Promise.all([loadCategories(), loadProducts()]);
-            setManualCategory(FALLBACK_CATEGORY);
-          } catch (error) {
-            Alert.alert(language === 'es' ? 'Error' : 'Error', error instanceof Error ? error.message : language === 'es' ? 'No se pudo eliminar la categoria' : 'Could not delete category');
-          }
-        },
+    showDangerConfirm({
+      title: language === 'es' ? 'Eliminar categoria' : 'Delete category',
+      message:
+        language === 'es'
+          ? `Se eliminara "${manualCategory}" y sus productos pasaran a "varios".`
+          : `"${manualCategory}" will be deleted and its products moved to "varios".`,
+      cancelText: language === 'es' ? 'Cancelar' : 'Cancel',
+      confirmText: language === 'es' ? 'Eliminar' : 'Delete',
+      onConfirm: async () => {
+        try {
+          await deleteCategory(manualCategory);
+          await Promise.all([loadCategories(), loadProducts()]);
+          setManualCategory(FALLBACK_CATEGORY);
+        } catch (error) {
+          Alert.alert(language === 'es' ? 'Error' : 'Error', error instanceof Error ? error.message : language === 'es' ? 'No se pudo eliminar la categoria' : 'Could not delete category');
+        }
       },
-    ]
-    );
+    });
   };
 
   const onChangeLanguage = async (nextLanguage: AppLanguage) => {
@@ -1955,8 +2490,88 @@ export default function App() {
     }
   };
 
+  const onToggleHideAmounts = async () => {
+    const next = !hideAmounts;
+    setHideAmounts(next);
+    try {
+      await saveHideAmounts(next);
+    } catch {
+      // Best effort.
+    }
+  };
+
+  const onSavePin = async () => {
+    const normalized = pinInput.trim();
+    if (!/^\d{4,8}$/.test(normalized)) {
+      Alert.alert(
+        language === 'es' ? 'PIN invalido' : 'Invalid PIN',
+        language === 'es'
+          ? 'Usa un PIN numerico de 4 a 8 digitos.'
+          : 'Use a numeric PIN with 4 to 8 digits.'
+      );
+      return;
+    }
+
+    setAppPin(normalized);
+    setPinInput('');
+    await saveAppPin(normalized);
+    Alert.alert(language === 'es' ? 'Listo' : 'Done', language === 'es' ? 'PIN guardado.' : 'PIN saved.');
+  };
+
+  const onToggleAppLock = async () => {
+    if (!appPin) {
+      Alert.alert(
+        language === 'es' ? 'PIN requerido' : 'PIN required',
+        language === 'es'
+          ? 'Primero define un PIN para habilitar el bloqueo.'
+          : 'Set a PIN first before enabling app lock.'
+      );
+      return;
+    }
+
+    const next = !appLockEnabled;
+    setAppLockEnabled(next);
+    await saveAppLockEnabled(next);
+    if (next) {
+      setIsUnlocked(false);
+      setPinInput('');
+    }
+  };
+
+  const onUnlockApp = () => {
+    if (!appLockEnabled) {
+      setIsUnlocked(true);
+      return;
+    }
+    if (pinInput.trim() === appPin) {
+      setIsUnlocked(true);
+      setPinInput('');
+      return;
+    }
+    Alert.alert(language === 'es' ? 'PIN incorrecto' : 'Wrong PIN');
+  };
+
   const onContactPress = async () => {
-    const mailToUrl = 'mailto:sebasretana27@gmail.com';
+    const subject = language === 'es' ? 'MyFinance - Reporte' : 'MyFinance - Report';
+    const body =
+      language === 'es'
+        ? [
+            'Describe aqui el error o sugerencia:',
+            '',
+            `Build: ${t.buildNumber}`,
+            `Idioma: ${language}`,
+            `Tema: ${themeMode}`,
+            `Plataforma: ${Platform.OS}`,
+          ].join('\n')
+        : [
+            'Describe your issue or suggestion:',
+            '',
+            `Build: ${t.buildNumber}`,
+            `Language: ${language}`,
+            `Theme: ${themeMode}`,
+            `Platform: ${Platform.OS}`,
+          ].join('\n');
+    const mailToUrl = buildMailtoUrl('sebasretana27@gmail.com', subject, body);
     const canOpen = await Linking.canOpenURL(mailToUrl);
     if (!canOpen) {
       Alert.alert(
@@ -1969,6 +2584,74 @@ export default function App() {
     }
 
     await Linking.openURL(mailToUrl);
+  };
+
+  const onExportBackup = async () => {
+    try {
+      const payload = await createBackupPayload();
+      await Share.share({
+        title: 'MyFinance Backup',
+        message: JSON.stringify(payload),
+      });
+    } catch (error) {
+      Alert.alert(
+        language === 'es' ? 'Error de backup' : 'Backup error',
+        error instanceof Error ? error.message : language === 'es' ? 'No se pudo exportar backup.' : 'Could not export backup.'
+      );
+    }
+  };
+
+  const onRestoreBackup = async () => {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(backupJsonInput);
+    } catch {
+      Alert.alert(
+        language === 'es' ? 'JSON invalido' : 'Invalid JSON',
+        language === 'es' ? 'El contenido no es un JSON valido.' : 'The content is not valid JSON.'
+      );
+      return;
+    }
+
+    if (!validateBackupPayload(parsed)) {
+      Alert.alert(
+        language === 'es' ? 'Backup invalido' : 'Invalid backup',
+        language === 'es'
+          ? 'El JSON no tiene el formato de respaldo esperado.'
+          : 'JSON does not match the expected backup format.'
+      );
+      return;
+    }
+
+    Alert.alert(
+      language === 'es' ? 'Restaurar backup' : 'Restore backup',
+      language === 'es'
+        ? 'Se intentara fusionar el respaldo con tus datos actuales. ¿Deseas continuar?'
+        : 'Backup will be merged with current local data. Continue?',
+      [
+        { text: language === 'es' ? 'Cancelar' : 'Cancel', style: 'cancel' },
+        {
+          text: language === 'es' ? 'Restaurar' : 'Restore',
+          onPress: async () => {
+            try {
+              await restoreBackupPayload(parsed as BackupPayload, 'merge');
+              await reloadAllData();
+              setIsRestoreBackupModalVisible(false);
+              setBackupJsonInput('');
+              Alert.alert(
+                language === 'es' ? 'Listo' : 'Done',
+                language === 'es' ? 'Backup restaurado correctamente.' : 'Backup restored successfully.'
+              );
+            } catch (error) {
+              Alert.alert(
+                language === 'es' ? 'Error de restore' : 'Restore error',
+                error instanceof Error ? error.message : language === 'es' ? 'No se pudo restaurar backup.' : 'Could not restore backup.'
+              );
+            }
+          },
+        },
+      ]
+    );
   };
 
   const onAddAccount = async () => {
@@ -1998,6 +2681,14 @@ export default function App() {
 
     try {
       await createAccount(normalizedName, parsedBalance, normalizedColor);
+      if (parsedBalance !== 0) {
+        await createAccountMovement({
+          type: 'account_adjustment',
+          amount: Number(parsedBalance.toFixed(2)),
+          accountName: normalizedName,
+          note: 'Initial account balance',
+        });
+      }
       await loadAccounts();
       setAccountName('');
       setAccountBalanceInput('');
@@ -2061,27 +2752,23 @@ export default function App() {
   };
 
   const onDeleteBudget = (category: string) => {
-    Alert.alert(
-      language === 'es' ? 'Eliminar presupuesto' : 'Delete budget',
-      language === 'es'
-        ? `Se eliminara el presupuesto de "${getCategoryLabel(category, language)}".`
-        : `Budget for "${getCategoryLabel(category, language)}" will be deleted.`,
-      [
-        { text: language === 'es' ? 'Cancelar' : 'Cancel', style: 'cancel' },
-        {
-          text: language === 'es' ? 'Eliminar' : 'Delete',
-          style: 'destructive',
-          onPress: async () => {
-            try {
-              await deleteBudget(category);
-              await loadBudgets();
-            } catch (error) {
-              Alert.alert(language === 'es' ? 'Error' : 'Error', error instanceof Error ? error.message : language === 'es' ? 'No se pudo eliminar el presupuesto' : 'Could not delete budget');
-            }
-          },
-        },
-      ]
-    );
+    showDangerConfirm({
+      title: language === 'es' ? 'Eliminar presupuesto' : 'Delete budget',
+      message:
+        language === 'es'
+          ? `Se eliminara el presupuesto de "${getCategoryLabel(category, language)}".`
+          : `Budget for "${getCategoryLabel(category, language)}" will be deleted.`,
+      cancelText: language === 'es' ? 'Cancelar' : 'Cancel',
+      confirmText: language === 'es' ? 'Eliminar' : 'Delete',
+      onConfirm: async () => {
+        try {
+          await deleteBudget(category);
+          await loadBudgets();
+        } catch (error) {
+          Alert.alert(language === 'es' ? 'Error' : 'Error', error instanceof Error ? error.message : language === 'es' ? 'No se pudo eliminar el presupuesto' : 'Could not delete budget');
+        }
+      },
+    });
   };
 
   const onSaveCategoryColor = async (color: string) => {
@@ -2128,9 +2815,37 @@ export default function App() {
       await updateAccountBalance(account.id, updatedBalance);
       if (operator === 1) {
         await createIncomeEntry('manual_add', movement, account.name);
-        await Promise.all([loadAccounts(), loadIncomeEntries()]);
+        await createAccountMovement({
+          type: 'income_manual',
+          amount: movement,
+          accountName: account.name,
+          note: 'Manual income',
+        });
+        await createTransaction({
+          type: 'income',
+          source: 'manual_add',
+          amount: movement,
+          category: FALLBACK_CATEGORY,
+          accountName: account.name,
+          note: 'Manual income',
+        });
+        await Promise.all([loadAccounts(), loadIncomeEntries(), loadTransactions()]);
       } else {
-        await loadAccounts();
+        await createAccountMovement({
+          type: 'account_adjustment',
+          amount: -movement,
+          accountName: account.name,
+          note: 'Manual account subtraction',
+        });
+        await createTransaction({
+          type: 'expense',
+          source: 'manual_subtract',
+          amount: movement,
+          category: FALLBACK_CATEGORY,
+          accountName: account.name,
+          note: 'Manual account subtraction',
+        });
+        await Promise.all([loadAccounts(), loadTransactions()]);
       }
       setAccountActionAmount('');
       setAccountActionType(null);
@@ -2168,41 +2883,149 @@ export default function App() {
       return;
     }
 
-    Alert.alert(
-      language === 'es' ? 'Eliminar cuenta' : 'Delete account',
-      language === 'es'
-        ? `Se eliminara la cuenta "${selectedAccountForAction.name}".`
-        : `Account "${selectedAccountForAction.name}" will be deleted.`,
-      [
-        { text: language === 'es' ? 'Cancelar' : 'Cancel', style: 'cancel' },
-        {
-          text: language === 'es' ? 'Eliminar' : 'Delete',
-          style: 'destructive',
-          onPress: async () => {
-            try {
-              await deleteAccountById(selectedAccountForAction.id);
-              await loadAccounts();
-              setIsAccountActionModalVisible(false);
-              setSelectedAccountForAction(null);
-              setAccountActionType(null);
-              setAccountActionAmount('');
-              Alert.alert(language === 'es' ? 'Listo' : 'Done', t.accountDeleted);
-            } catch (error) {
-              Alert.alert(language === 'es' ? 'Error' : 'Error', error instanceof Error ? error.message : language === 'es' ? 'No se pudo eliminar la cuenta' : 'Could not delete account');
-            }
-          },
-        },
-      ]
-    );
+    showDangerConfirm({
+      title: language === 'es' ? 'Eliminar cuenta' : 'Delete account',
+      message:
+        language === 'es'
+          ? `Se eliminara la cuenta "${selectedAccountForAction.name}". Esta accion no se puede deshacer.`
+          : `Account "${selectedAccountForAction.name}" will be deleted. This action cannot be undone.`,
+      cancelText: language === 'es' ? 'Cancelar' : 'Cancel',
+      confirmText: language === 'es' ? 'Eliminar' : 'Delete',
+      onConfirm: async () => {
+        try {
+          await deleteAccountById(selectedAccountForAction.id);
+          await loadAccounts();
+          setIsAccountActionModalVisible(false);
+          setSelectedAccountForAction(null);
+          setAccountActionType(null);
+          setAccountActionAmount('');
+          Alert.alert(language === 'es' ? 'Listo' : 'Done', t.accountDeleted);
+        } catch (error) {
+          Alert.alert(language === 'es' ? 'Error' : 'Error', error instanceof Error ? error.message : language === 'es' ? 'No se pudo eliminar la cuenta' : 'Could not delete account');
+        }
+      },
+    });
   };
 
   const onConfirmAccountAction = async () => {
-    if (!selectedAccountForAction || !accountActionType) {
+    if (!selectedAccountForAction) {
+      Alert.alert(
+        language === 'es' ? 'Cuenta requerida' : 'Account required',
+        language === 'es'
+          ? 'Selecciona una cuenta antes de aplicar el movimiento.'
+          : 'Select an account before applying movement.'
+      );
+      return;
+    }
+
+    if (!accountActionType) {
+      Alert.alert(
+        language === 'es' ? 'Tipo requerido' : 'Type required',
+        language === 'es'
+          ? 'Selecciona si deseas agregar o restar ingresos.'
+          : 'Select whether you want to add or subtract income.'
+      );
       return;
     }
 
     const operator: 1 | -1 = accountActionType === 'add' ? 1 : -1;
     await onApplyAccountMovement(selectedAccountForAction, operator, accountActionAmount);
+  };
+
+  const onApplyInternalTransfer = async () => {
+    const from = accounts.find((item) => item.id === internalTransferFromId);
+    const to = accounts.find((item) => item.id === internalTransferToId);
+    const parsed = parseAmountInput(internalTransferAmount);
+
+    if (!from || !to) {
+      Alert.alert(
+        language === 'es' ? 'Cuentas requeridas' : 'Accounts required',
+        language === 'es'
+          ? 'Selecciona la cuenta origen y destino.'
+          : 'Select source and destination accounts.'
+      );
+      return;
+    }
+
+    if (from.id === to.id) {
+      Alert.alert(
+        language === 'es' ? 'Transferencia invalida' : 'Invalid transfer',
+        language === 'es'
+          ? 'La cuenta origen y destino deben ser diferentes.'
+          : 'Source and destination accounts must be different.'
+      );
+      return;
+    }
+
+    if (!Number.isFinite(parsed) || parsed <= 0) {
+      Alert.alert(
+        language === 'es' ? 'Monto invalido' : 'Invalid amount',
+        language === 'es'
+          ? 'Ingresa un monto mayor que 0.'
+          : 'Enter an amount greater than 0.'
+      );
+      return;
+    }
+
+    if (from.balance < parsed) {
+      Alert.alert(
+        language === 'es' ? 'Fondos insuficientes' : 'Insufficient funds',
+        language === 'es'
+          ? `La cuenta "${from.name}" no tiene saldo suficiente.`
+          : `Account "${from.name}" has insufficient balance.`
+      );
+      return;
+    }
+
+    const fromNext = Number((from.balance - parsed).toFixed(2));
+    const toNext = Number((to.balance + parsed).toFixed(2));
+
+    try {
+      await updateAccountBalance(from.id, fromNext);
+      await updateAccountBalance(to.id, toNext);
+      await createAccountMovement({
+        type: 'transfer_out',
+        amount: -parsed,
+        accountName: from.name,
+        note: `Internal transfer to ${to.name}`,
+      });
+      await createAccountMovement({
+        type: 'transfer_in',
+        amount: parsed,
+        accountName: to.name,
+        note: `Internal transfer from ${from.name}`,
+      });
+      await createTransaction({
+        type: 'transfer_out',
+        source: 'internal_transfer',
+        amount: parsed,
+        accountName: from.name,
+        category: FALLBACK_CATEGORY,
+        note: `Internal transfer to ${to.name}`,
+      });
+      await createTransaction({
+        type: 'transfer_in',
+        source: 'internal_transfer',
+        amount: parsed,
+        accountName: to.name,
+        category: FALLBACK_CATEGORY,
+        note: `Internal transfer from ${from.name}`,
+      });
+      await Promise.all([loadAccounts(), loadTransactions()]);
+      setInternalTransferAmount('');
+      setIsInternalTransferModalVisible(false);
+      Alert.alert(
+        language === 'es' ? 'Transferencia aplicada' : 'Transfer applied',
+        language === 'es'
+          ? `Se movio ${displayCurrency(parsed)} de "${from.name}" a "${to.name}".`
+          : `${displayCurrency(parsed)} moved from "${from.name}" to "${to.name}".`
+      );
+    } catch (error) {
+      Alert.alert(
+        language === 'es' ? 'Error' : 'Error',
+        error instanceof Error ? error.message : language === 'es' ? 'No se pudo transferir' : 'Could not transfer'
+      );
+    }
   };
 
   const renderColorTable = (
@@ -2243,117 +3066,216 @@ export default function App() {
   const chartTrackColor = themeMode === 'dark' ? darkModeChartTrack : theme.borderStrong;
   const getChartSliceColor = (category: string) =>
     themeMode === 'dark' ? darkModeChartSlice : (categoryColorMap[category] ?? '#94a3b8');
-  const expenseTabsHintTrackWidth = 56;
-  const expenseTabsHintThumbWidth = Math.max(
-    14,
-    Math.min(expenseTabsHintTrackWidth * 0.8, (expenseTabsViewportWidth / expenseTabsContentWidth) * expenseTabsHintTrackWidth)
-  );
-  const expenseTabsHintThumbTranslate =
-    (expenseTabsHintTrackWidth - expenseTabsHintThumbWidth) * expenseTabsScrollRatio;
   const statusBarStyle = themeMode === 'light' ? 'dark' : 'light';
-  const productsByMonthCard = (
+  const canSaveManualExpense = useMemo(() => {
+    const parsedQuantity = Number(quantity);
+    const parsedAmount = parseAmountInput(amount);
+    return (
+      description.trim().length > 0 &&
+      Number.isInteger(parsedQuantity) &&
+      parsedQuantity > 0 &&
+      Number.isFinite(parsedAmount) &&
+      parsedAmount > 0 &&
+      hasValidCategory(manualCategory, categories) &&
+      selectedExpenseAccountId != null
+    );
+  }, [amount, categories, description, manualCategory, quantity, selectedExpenseAccountId]);
+  const canAnalyzeReceipt = ocrText.trim().length > 0;
+  const parsedReceiptTotalInput = parseAmountInput(receiptTotalInput);
+  const canSaveDetectedProducts =
+    receiptAnalysis != null &&
+    selectedReceiptAccountId != null &&
+    hasValidCategory(receiptCategory, categories) &&
+    ((Number.isFinite(parsedReceiptTotalInput) && parsedReceiptTotalInput > 0) ||
+      (receiptAnalysis?.totalAmount ?? 0) > 0);
+  const parsedTransferTotalInput = parseAmountInput(transferTotalInput);
+  const canApplyTransfer =
+    transferMode != null &&
+    selectedTransferAccountId != null &&
+    ((Number.isFinite(parsedTransferTotalInput) && parsedTransferTotalInput > 0) ||
+      (Number.isFinite(transferTotalAmount) && transferTotalAmount > 0));
+  const gastosTabItems = useMemo<HorizontalTabItem<GastosTopTab>[]>(
+    () => [
+      { key: 'manual', label: t.tabManualExpense },
+      { key: 'receipt', label: t.tabUploadReceipt },
+      { key: 'transfer', label: t.tabTransfer },
+      { key: 'total', label: t.tabTotal },
+      { key: 'income_added', label: t.tabIncomeAdded },
+    ],
+    [t.tabIncomeAdded, t.tabManualExpense, t.tabTotal, t.tabTransfer, t.tabUploadReceipt]
+  );
+  const transactionsCard = (
     <View style={styles.card}>
-      <Text style={styles.sectionTitle}>{t.productsByMonth}</Text>
+      <Text style={styles.sectionTitle}>{language === 'es' ? 'Transacciones' : 'Transactions'}</Text>
       <View style={styles.filterWrap}>
-        <Text style={styles.filterLabel}>{t.filterYear}</Text>
+        <Text style={styles.filterLabel}>{language === 'es' ? 'Rango rapido' : 'Quick range'}</Text>
         <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.chipScroll}>
-          {yearOptions.map((year) => (
-            <TouchableOpacity
-              key={year}
-              style={[styles.filterChip, selectedYear === year ? styles.filterChipActive : undefined]}
-              onPress={() => setSelectedYear(year)}
-            >
-              <Text style={[styles.filterChipText, selectedYear === year ? styles.filterChipTextActive : undefined]}>
-                {year === 'all' ? 'Todos' : year}
-              </Text>
-            </TouchableOpacity>
-          ))}
+          <TouchableOpacity
+            style={[styles.filterChip, quickDateFilter === 'all' ? styles.filterChipActive : undefined]}
+            onPress={() => setQuickDateFilter('all')}
+          >
+            <Text style={[styles.filterChipText, quickDateFilter === 'all' ? styles.filterChipTextActive : undefined]}>
+              {language === 'es' ? 'Todo' : 'All'}
+            </Text>
+          </TouchableOpacity>
+          <TouchableOpacity
+            style={[styles.filterChip, quickDateFilter === 'today' ? styles.filterChipActive : undefined]}
+            onPress={() => setQuickDateFilter('today')}
+          >
+            <Text style={[styles.filterChipText, quickDateFilter === 'today' ? styles.filterChipTextActive : undefined]}>
+              {language === 'es' ? 'Hoy' : 'Today'}
+            </Text>
+          </TouchableOpacity>
+          <TouchableOpacity
+            style={[styles.filterChip, quickDateFilter === '7d' ? styles.filterChipActive : undefined]}
+            onPress={() => setQuickDateFilter('7d')}
+          >
+            <Text style={[styles.filterChipText, quickDateFilter === '7d' ? styles.filterChipTextActive : undefined]}>
+              {language === 'es' ? '7 dias' : '7 days'}
+            </Text>
+          </TouchableOpacity>
+          <TouchableOpacity
+            style={[styles.filterChip, quickDateFilter === 'month' ? styles.filterChipActive : undefined]}
+            onPress={() => setQuickDateFilter('month')}
+          >
+            <Text style={[styles.filterChipText, quickDateFilter === 'month' ? styles.filterChipTextActive : undefined]}>
+              {language === 'es' ? 'Este mes' : 'This month'}
+            </Text>
+          </TouchableOpacity>
         </ScrollView>
 
-        <Text style={styles.filterLabel}>{t.filterMonth}</Text>
+        <Text style={styles.filterLabel}>{language === 'es' ? 'Ordenar por' : 'Sort by'}</Text>
         <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.chipScroll}>
-          {monthOptions.map((month) => (
-            <TouchableOpacity
-              key={month.value}
-              style={[styles.filterChip, selectedMonth === month.value ? styles.filterChipActive : undefined]}
-              onPress={() => setSelectedMonth(month.value)}
+          <TouchableOpacity
+            style={[
+              styles.filterChip,
+              transactionSortField === 'date' && transactionSortDirection === 'desc'
+                ? styles.filterChipActive
+                : undefined,
+            ]}
+            onPress={() => {
+              setTransactionSortField('date');
+              setTransactionSortDirection('desc');
+            }}
+          >
+            <Text
+              style={[
+                styles.filterChipText,
+                transactionSortField === 'date' && transactionSortDirection === 'desc'
+                  ? styles.filterChipTextActive
+                  : undefined,
+              ]}
             >
-              <Text
-                style={[
-                  styles.filterChipText,
-                  selectedMonth === month.value ? styles.filterChipTextActive : undefined,
-                ]}
-              >
-                {month.label}
-              </Text>
-            </TouchableOpacity>
-          ))}
+              {language === 'es' ? 'Fecha mas reciente' : 'Newest date'}
+            </Text>
+          </TouchableOpacity>
+          <TouchableOpacity
+            style={[
+              styles.filterChip,
+              transactionSortField === 'date' && transactionSortDirection === 'asc'
+                ? styles.filterChipActive
+                : undefined,
+            ]}
+            onPress={() => {
+              setTransactionSortField('date');
+              setTransactionSortDirection('asc');
+            }}
+          >
+            <Text
+              style={[
+                styles.filterChipText,
+                transactionSortField === 'date' && transactionSortDirection === 'asc'
+                  ? styles.filterChipTextActive
+                  : undefined,
+              ]}
+            >
+              {language === 'es' ? 'Fecha mas antigua' : 'Oldest date'}
+            </Text>
+          </TouchableOpacity>
+          <TouchableOpacity
+            style={[
+              styles.filterChip,
+              transactionSortField === 'amount' && transactionSortDirection === 'desc'
+                ? styles.filterChipActive
+                : undefined,
+            ]}
+            onPress={() => {
+              setTransactionSortField('amount');
+              setTransactionSortDirection('desc');
+            }}
+          >
+            <Text
+              style={[
+                styles.filterChipText,
+                transactionSortField === 'amount' && transactionSortDirection === 'desc'
+                  ? styles.filterChipTextActive
+                  : undefined,
+              ]}
+            >
+              {language === 'es' ? 'Monto mayor' : 'Highest amount'}
+            </Text>
+          </TouchableOpacity>
+          <TouchableOpacity
+            style={[
+              styles.filterChip,
+              transactionSortField === 'amount' && transactionSortDirection === 'asc'
+                ? styles.filterChipActive
+                : undefined,
+            ]}
+            onPress={() => {
+              setTransactionSortField('amount');
+              setTransactionSortDirection('asc');
+            }}
+          >
+            <Text
+              style={[
+                styles.filterChipText,
+                transactionSortField === 'amount' && transactionSortDirection === 'asc'
+                  ? styles.filterChipTextActive
+                  : undefined,
+              ]}
+            >
+              {language === 'es' ? 'Monto menor' : 'Lowest amount'}
+            </Text>
+          </TouchableOpacity>
         </ScrollView>
-
-        <Text style={styles.filterLabel}>{t.filterSearch}</Text>
-        <View style={styles.searchWrap}>
-          <Text style={styles.searchIcon}>?</Text>
-          <TextInput
-            value={productQuery}
-            onChangeText={setProductQuery}
-            placeholder={t.searchPlaceholder}
-            placeholderTextColor={theme.placeholder}
-            style={styles.searchInput}
-          />
-        </View>
-
-        {normalizedQuery && predictions.length > 0 ? (
-          <View style={styles.predictionList}>
-            {predictions.map((prediction) => (
-              <TouchableOpacity
-                key={prediction.name}
-                style={styles.predictionItem}
-                onPress={() => onSelectPrediction(prediction.name)}
-              >
-                <Text style={styles.predictionText}>{prediction.name}</Text>
-              </TouchableOpacity>
-            ))}
-          </View>
-        ) : null}
 
         <TouchableOpacity style={styles.secondaryButton} onPress={onClearFilters}>
           <Text style={styles.secondaryButtonText}>{t.clearFilters}</Text>
+        </TouchableOpacity>
+        <TouchableOpacity style={styles.secondaryButton} onPress={() => void onExportTransactionsCsv()}>
+          <Text style={styles.secondaryButtonText}>{language === 'es' ? 'Exportar CSV' : 'Export CSV'}</Text>
         </TouchableOpacity>
       </View>
 
       {loading ? (
         <Text style={styles.loading}>{t.loadingData}</Text>
-      ) : groupedProducts.length === 0 ? (
-        <Text style={styles.empty}>{t.noProductsForFilters}</Text>
+      ) : filteredTransactions.length === 0 ? (
+        <Text style={styles.empty}>
+          {language === 'es' ? 'No hay movimientos para este filtro.' : 'No movements found for this filter.'}
+        </Text>
       ) : (
-        groupedProducts.map((group) => (
-          <View key={group.monthKey} style={styles.monthGroup}>
-            <Text style={styles.monthTitle}>{group.monthLabel}</Text>
-            <View style={styles.totalRow}>
-              <Text style={styles.totalLabel}>{t.total}</Text>
-              <Text style={styles.totalValue}>
-                {formatCurrency(group.items.reduce((sum, item) => sum + item.lineTotal, 0), language, numberFormat)}
+        filteredTransactions.map((item) => {
+          const signedAmount = getTransactionSignedAmount(item);
+          return (
+            <View key={item.id} style={styles.itemRow}>
+              <View style={styles.itemTextWrap}>
+                <Text style={styles.itemDesc}>{getTransactionTypeLabel(item.type, language)}</Text>
+                <Text style={styles.itemDate}>
+                  {t.account}: {item.accountName || t.noAccount}
+                </Text>
+                <Text style={styles.itemDate}>
+                  {t.category}: {getCategoryLabel(item.category || FALLBACK_CATEGORY, language)}
+                </Text>
+                <Text style={styles.itemDate}>{formatDateTime(item.createdAt, dateLocale)}</Text>
+              </View>
+              <Text style={[styles.itemAmount, signedAmount < 0 ? styles.negativeBudget : undefined]}>
+                {signedAmount < 0 ? '-' : '+'}
+                {displayCurrency(Math.abs(signedAmount))}
               </Text>
             </View>
-
-            {group.items.map((item) => (
-              <View key={item.id} style={styles.itemRow}>
-                <View style={styles.itemTextWrap}>
-                  <Text style={styles.itemDesc}>{item.name}</Text>
-                  <Text style={styles.itemDate}>{t.quantity}: {item.quantity}</Text>
-                  <Text style={styles.itemDate}>{t.account}: {item.accountName || t.noAccount}</Text>
-                  <Text style={styles.itemDate}>{formatDateTime(item.createdAt, dateLocale)}</Text>
-                </View>
-                <View style={styles.productActionWrap}>
-                  <Text style={styles.itemAmount}>{formatCurrency(item.unitPrice, language, numberFormat)}</Text>
-                  <TouchableOpacity style={styles.deleteTableButton} onPress={() => onDeleteProduct(item.id)}>
-                    <Text style={styles.deleteTableButtonText}>{t.delete}</Text>
-                  </TouchableOpacity>
-                </View>
-              </View>
-            ))}
-          </View>
-        ))
+          );
+        })
       )}
     </View>
   );
@@ -2366,9 +3288,12 @@ export default function App() {
           <ScrollView contentContainerStyle={styles.container}>
           <View style={styles.headerRow}>
             <TouchableOpacity style={styles.menuButton} onPress={openDrawer}>
-              <Text style={styles.menuIcon}>☰</Text>
+              <Text style={styles.menuIcon}>{'\u2630'}</Text>
             </TouchableOpacity>
-            <Text style={styles.title}>MyFinance</Text>
+            <View style={styles.headerTitleWrap}>
+              <Text style={styles.title}>MyFinance</Text>
+              <Text style={styles.headerCaption}>{capitalize(currentMonthLabel)}</Text>
+            </View>
           </View>
           {activeSection !== 'inicio' ? (
             <Text style={styles.subtitle}>
@@ -2386,29 +3311,132 @@ export default function App() {
 
           {activeSection === 'inicio' ? (
             <>
-              <View style={styles.topSummaryRow}>
-                <View style={styles.leftSummaryColumn}>
-                  <View style={[styles.accountsTotalCard, styles.leftSummaryCard]}>
-                    <Text style={styles.accountsTotalLabel}>{t.antExpense}</Text>
-                    <Text style={styles.hormigaName}>{topVariosProduct ? topVariosProduct.name : t.noData}</Text>
-                    <Text style={styles.accountsTotalValue}>
-                      {topVariosProduct ? formatCurrency(topVariosProduct.totalAmount, language, numberFormat) : formatCurrency(0, language, numberFormat)}
-                    </Text>
-                  </View>
+              <View style={styles.homeHeroCard}>
+                <Text style={styles.homeHeroLabel}>{t.totalAccounts}</Text>
+                <Text style={styles.homeHeroValue}>{displayCurrency(totalAccountsBalance)}</Text>
+                <Text style={styles.homeHeroSubLabel}>{capitalize(currentMonthLabel)}</Text>
+              </View>
 
-                  <View style={[styles.accountsTotalCard, styles.leftSummaryCard]}>
-                    <Text style={styles.accountsTotalLabel}>{t.transport}</Text>
-                    <Text style={styles.accountsTotalValue}>{formatCurrency(currentMonthTransportTotal, language, numberFormat)}</Text>
-                  </View>
+              <View style={styles.homeMetricsRow}>
+                <View style={styles.homeMetricCard}>
+                  <Text style={styles.accountsTotalLabel}>{t.antExpense}</Text>
+                  {topVariosProduct ? (
+                    <>
+                      <Text style={styles.hormigaName}>{topVariosProduct.name}</Text>
+                      <Text style={styles.accountsTotalValue}>{displayCurrency(topVariosProduct.totalAmount)}</Text>
+                    </>
+                  ) : (
+                    <Text style={styles.homeNoDataText}>{t.noData}</Text>
+                  )}
                 </View>
+                <View style={styles.homeMetricCard}>
+                  <Text style={styles.accountsTotalLabel}>{t.transport}</Text>
+                  {currentMonthTransportTotal > 0 ? (
+                    <Text style={styles.accountsTotalValue}>{displayCurrency(currentMonthTransportTotal)}</Text>
+                  ) : (
+                    <Text style={styles.homeNoDataText}>{t.noData}</Text>
+                  )}
+                </View>
+              </View>
 
-                <View style={[styles.accountsTotalCard, styles.rightSummaryCard]}>
-                  <Text style={styles.accountsTotalLabel}>{t.totalAccounts}</Text>
-                  <Text style={styles.accountsTotalValue}>{formatCurrency(totalAccountsBalance, language, numberFormat)}</Text>
+              <View style={styles.homeMetricsRow}>
+                <View style={styles.homeMetricCard}>
+                  <Text style={styles.accountsTotalLabel}>{language === 'es' ? 'Mes anterior' : 'Previous month'}</Text>
+                  {previousMonthTotal > 0 ? (
+                    <Text style={styles.accountsTotalValue}>{displayCurrency(previousMonthTotal)}</Text>
+                  ) : (
+                    <Text style={styles.homeNoDataText}>{t.noData}</Text>
+                  )}
+                </View>
+                <View style={styles.homeMetricCard}>
+                  <Text style={styles.accountsTotalLabel}>{language === 'es' ? 'Categoria top' : 'Top category'}</Text>
+                  {topCategoryThisMonth ? (
+                    <>
+                      <Text style={styles.hormigaName}>
+                        {getCategoryLabel(topCategoryThisMonth.category, language)}
+                      </Text>
+                      <Text style={styles.accountsTotalValue}>
+                        {displayCurrency(topCategoryThisMonth.total)}
+                      </Text>
+                    </>
+                  ) : (
+                    <Text style={styles.homeNoDataText}>{t.noData}</Text>
+                  )}
                 </View>
               </View>
 
               <View style={styles.card}>
+                <Text style={styles.sectionTitle}>{language === 'es' ? 'Resumen mensual' : 'Monthly summary'}</Text>
+                <View style={styles.homeSummaryGrid}>
+                  <View style={styles.homeSummaryCard}>
+                    <Text style={styles.homeSummaryLabel}>{language === 'es' ? 'Ingresos del mes' : 'Monthly income'}</Text>
+                    <Text style={styles.homeSummaryValue}>
+                      {currentMonthTransactions.length > 0 ? displayCurrency(currentMonthIncomeTotal) : t.noData}
+                    </Text>
+                  </View>
+                  <View style={styles.homeSummaryCard}>
+                    <Text style={styles.homeSummaryLabel}>{language === 'es' ? 'Gastos del mes' : 'Monthly expenses'}</Text>
+                    <Text style={styles.homeSummaryValue}>
+                      {currentMonthTransactions.length > 0 ? displayCurrency(currentMonthExpenseTotal) : t.noData}
+                    </Text>
+                  </View>
+                  <View style={[styles.homeSummaryCard, styles.homeSummaryCardFull]}>
+                    <Text style={styles.homeSummaryLabel}>{language === 'es' ? 'Balance del mes' : 'Monthly balance'}</Text>
+                    <Text style={styles.homeSummaryValue}>
+                      {currentMonthTransactions.length > 0 ? displayCurrency(currentMonthBalance) : t.noData}
+                    </Text>
+                  </View>
+                </View>
+              </View>
+
+              <View style={styles.card}>
+                <Text style={styles.sectionTitle}>{language === 'es' ? 'Insights' : 'Insights'}</Text>
+                <View style={styles.homeSummaryGrid}>
+                  <View style={styles.homeSummaryCard}>
+                    <Text style={styles.homeSummaryLabel}>{language === 'es' ? 'Categoria top gasto' : 'Top spending category'}</Text>
+                    {topCategoryThisMonth ? (
+                      <>
+                        <Text style={styles.homeSummaryText}>
+                          {getCategoryLabel(topCategoryThisMonth.category, language)}
+                        </Text>
+                        <Text style={styles.homeSummaryValue}>
+                          {displayCurrency(topCategoryThisMonth.total)}
+                        </Text>
+                      </>
+                    ) : (
+                      <Text style={styles.homeNoDataText}>{t.noData}</Text>
+                    )}
+                  </View>
+                  <View style={styles.homeSummaryCard}>
+                    <Text style={styles.homeSummaryLabel}>{language === 'es' ? 'Producto más comprado' : 'Most purchased product'}</Text>
+                    {topProductThisMonth ? (
+                      <>
+                        <Text style={styles.homeSummaryText}>{topProductThisMonth.name}</Text>
+                        <Text style={styles.homeSummaryValue}>
+                          {topProductThisMonth.totalUnits} {language === 'es' ? 'uds' : 'units'}
+                        </Text>
+                      </>
+                    ) : (
+                      <Text style={styles.homeNoDataText}>{t.noData}</Text>
+                    )}
+                  </View>
+                  <View style={[styles.homeSummaryCard, styles.homeSummaryCardFull]}>
+                    <Text style={styles.homeSummaryLabel}>{language === 'es' ? 'Cuenta con mayor movimiento' : 'Highest movement account'}</Text>
+                    {topMovementAccountThisMonth ? (
+                      <>
+                        <Text style={styles.homeSummaryText}>{topMovementAccountThisMonth.accountName}</Text>
+                        <Text style={styles.homeSummaryValue}>
+                          {displayCurrency(topMovementAccountThisMonth.amount)}
+                        </Text>
+                      </>
+                    ) : (
+                      <Text style={styles.homeNoDataText}>{t.noData}</Text>
+                    )}
+                  </View>
+                </View>
+              </View>
+
+              <View style={[styles.card, styles.homeChartCard]}>
                 <Text style={styles.sectionTitle}>{t.spendingStructure}</Text>
                 <Text style={styles.helpText}>{capitalize(currentMonthLabel)}</Text>
 
@@ -2453,7 +3481,7 @@ export default function App() {
                     <View style={[styles.emptyChart, { borderColor: chartTrackColor }]}></View>
                   )}
                   <View style={styles.chartCenter}>
-                    <Text style={styles.chartCenterValue}>{formatCurrency(currentMonthTotal, language, numberFormat)}</Text>
+                    <Text style={styles.chartCenterValue}>{displayCurrency(currentMonthTotal)}</Text>
                   </View>
                 </View>
 
@@ -2464,7 +3492,7 @@ export default function App() {
                         <View style={[styles.legendDot, { backgroundColor: getChartSliceColor(slice.category) }]} />
                         <Text style={styles.legendText}>{getCategoryLabel(slice.category, language)}</Text>
                         <Text style={styles.legendValue}>
-                          {slice.percentage.toFixed(1)}% ({formatCurrency(slice.total, language, numberFormat)})
+                          {slice.percentage.toFixed(1)}% ({displayCurrency(slice.total)})
                         </Text>
                       </View>
                     ))}
@@ -2478,73 +3506,20 @@ export default function App() {
           {activeSection === 'gastos' ? (
             <>
               <View style={styles.expenseTopTabs}>
-                <ScrollView
-                  horizontal
-                  showsHorizontalScrollIndicator={false}
-                  contentContainerStyle={styles.expenseTopTabsScrollContent}
-                  onLayout={(event) => setExpenseTabsViewportWidth(event.nativeEvent.layout.width)}
-                  onContentSizeChange={(width) => setExpenseTabsContentWidth(width)}
-                  onScroll={(event) => {
-                    const scrollX = event.nativeEvent.contentOffset.x;
-                    const viewportWidth = Math.max(1, event.nativeEvent.layoutMeasurement.width);
-                    const contentWidth = Math.max(1, event.nativeEvent.contentSize.width);
-                    const maxScroll = Math.max(0, contentWidth - viewportWidth);
-                    const ratio = maxScroll > 0 ? Math.min(1, Math.max(0, scrollX / maxScroll)) : 0;
-                    setExpenseTabsViewportWidth(viewportWidth);
-                    setExpenseTabsContentWidth(contentWidth);
-                    setExpenseTabsScrollRatio(ratio);
+                <HorizontalTabs
+                  items={gastosTabItems}
+                  activeKey={gastosTopTab}
+                  onChange={setGastosTopTab}
+                  colors={{
+                    border: theme.border,
+                    text: theme.textSoft,
+                    activeText: theme.accentText,
+                    activeBg: theme.navActiveBg,
+                    activeBorder: theme.accentStrong,
+                    surface: theme.surfaceAlt,
+                    indicator: theme.textMuted,
                   }}
-                  scrollEventThrottle={16}
-                >
-                  <TouchableOpacity
-                    style={[styles.expenseTopTab, gastosTopTab === 'manual' ? styles.expenseTopTabActive : undefined]}
-                    onPress={() => setGastosTopTab('manual')}
-                  >
-                    <Text style={[styles.expenseTopTabText, gastosTopTab === 'manual' ? styles.expenseTopTabTextActive : undefined]}>
-                      {t.tabManualExpense}
-                    </Text>
-                  </TouchableOpacity>
-                  <TouchableOpacity
-                    style={[styles.expenseTopTab, gastosTopTab === 'receipt' ? styles.expenseTopTabActive : undefined]}
-                    onPress={() => setGastosTopTab('receipt')}
-                  >
-                    <Text style={[styles.expenseTopTabText, gastosTopTab === 'receipt' ? styles.expenseTopTabTextActive : undefined]}>
-                      {t.tabUploadReceipt}
-                    </Text>
-                  </TouchableOpacity>
-                  <TouchableOpacity
-                    style={[styles.expenseTopTab, gastosTopTab === 'transfer' ? styles.expenseTopTabActive : undefined]}
-                    onPress={() => setGastosTopTab('transfer')}
-                  >
-                    <Text style={[styles.expenseTopTabText, gastosTopTab === 'transfer' ? styles.expenseTopTabTextActive : undefined]}>
-                      {t.tabTransfer}
-                    </Text>
-                  </TouchableOpacity>
-                  <TouchableOpacity
-                    style={[styles.expenseTopTab, gastosTopTab === 'total' ? styles.expenseTopTabActive : undefined]}
-                    onPress={() => setGastosTopTab('total')}
-                  >
-                    <Text style={[styles.expenseTopTabText, gastosTopTab === 'total' ? styles.expenseTopTabTextActive : undefined]}>
-                      {t.tabTotal}
-                    </Text>
-                  </TouchableOpacity>
-                  <TouchableOpacity
-                    style={[styles.expenseTopTab, gastosTopTab === 'income_added' ? styles.expenseTopTabActive : undefined]}
-                    onPress={() => setGastosTopTab('income_added')}
-                  >
-                    <Text style={[styles.expenseTopTabText, gastosTopTab === 'income_added' ? styles.expenseTopTabTextActive : undefined]}>
-                      {t.tabIncomeAdded}
-                    </Text>
-                  </TouchableOpacity>
-                </ScrollView>
-                <View style={styles.expenseTopTabsHintTrack}>
-                  <View
-                    style={[
-                      styles.expenseTopTabsHintThumb,
-                      { width: expenseTabsHintThumbWidth, transform: [{ translateX: expenseTabsHintThumbTranslate }] },
-                    ]}
-                  />
-                </View>
+                />
               </View>
               {gastosTopTab === 'receipt' ? (
               <View style={styles.card}>
@@ -2572,6 +3547,11 @@ export default function App() {
                 {receiptImageUri ? <Image source={{ uri: receiptImageUri }} style={styles.previewImage} /> : null}
 
                 <Text style={styles.helpText}>{t.receiptHelp}</Text>
+                <Text style={styles.helpText}>
+                  {language === 'es'
+                    ? 'Tip: recorta la imagen para que se vea claramente el total y evita texto irrelevante.'
+                    : 'Tip: crop image so total amount is clear and avoid irrelevant text.'}
+                </Text>
                 <Text style={styles.filterLabel}>{t.category}</Text>
                 <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.chipScroll}>
                   {categories.map((category) => (
@@ -2630,7 +3610,11 @@ export default function App() {
                   textAlignVertical="top"
                 />
 
-                <TouchableOpacity style={styles.secondaryButton} onPress={onAnalyzeReceipt}>
+                <TouchableOpacity
+                  style={[styles.secondaryButton, !canAnalyzeReceipt ? styles.primaryButtonDisabled : undefined]}
+                  onPress={onAnalyzeReceipt}
+                  disabled={!canAnalyzeReceipt}
+                >
                   <Text style={styles.secondaryButtonText}>{t.analyzeReceipt}</Text>
                 </TouchableOpacity>
 
@@ -2646,10 +3630,87 @@ export default function App() {
                     </View>
                     <View style={styles.summaryRow}>
                       <Text style={styles.summaryLabel}>{t.totalMoney}</Text>
-                      <Text style={styles.summaryValue}>{formatCurrency(receiptAnalysis.totalAmount, language, numberFormat)}</Text>
+                      <Text style={styles.summaryValue}>{displayCurrency(receiptAnalysis.totalAmount)}</Text>
                     </View>
+                    {receiptAnalysis.warnings.length > 0 ? (
+                      <View style={styles.receiptWarningsBox}>
+                        {receiptAnalysis.warnings.map((warning, index) => (
+                          <Text key={`receipt-warning-${index}`} style={styles.receiptWarningText}>
+                            {warning}
+                          </Text>
+                        ))}
+                      </View>
+                    ) : null}
+                    {DEV_OCR_DEBUG ? (
+                      <View style={styles.ocrDebugBox}>
+                        <Text style={styles.ocrDebugTitle}>
+                          {language === 'es' ? 'Depuracion OCR' : 'OCR Debug'}
+                        </Text>
+                        <Text style={styles.ocrDebugLabel}>
+                          {language === 'es' ? 'Texto OCR completo' : 'Full OCR text'}
+                        </Text>
+                        <Text style={styles.ocrDebugText}>{ocrText || '-'}</Text>
+                        <Text style={styles.ocrDebugLabel}>
+                          {language === 'es' ? 'Lineas normalizadas' : 'Normalized lines'}
+                        </Text>
+                        <Text style={styles.ocrDebugText}>
+                          {(receiptAnalysis.debug?.normalizedLines ?? [])
+                            .map((line, idx) => `${idx + 1}. ${line}`)
+                            .join('\n') || '-'}
+                        </Text>
+                        <Text style={styles.ocrDebugLabel}>
+                          {language === 'es'
+                            ? 'Candidatos de total (score)'
+                            : 'Total candidates (score)'}
+                        </Text>
+                        <Text style={styles.ocrDebugText}>
+                          {(receiptAnalysis.debug?.totalCandidates ?? [])
+                            .slice(0, 12)
+                            .map(
+                              (candidate) =>
+                                `${candidate.selected ? '[*]' : '[ ]'} #${candidate.lineIndex + 1} ${candidate.amount.toFixed(2)} | score=${candidate.score} | ${candidate.reason} | ${candidate.line}`
+                            )
+                            .join('\n') || '-'}
+                        </Text>
+                        <Text style={styles.ocrDebugLabel}>
+                          {language === 'es' ? 'Total elegido' : 'Selected total'}
+                        </Text>
+                        <Text style={styles.ocrDebugText}>
+                          {receiptAnalysis.debug?.selectedTotal
+                            ? `${receiptAnalysis.debug.selectedTotal.amount.toFixed(2)} | confidence=${receiptAnalysis.debug.selectedTotal.confidence} | ${receiptAnalysis.debug.selectedTotal.reason}`
+                            : '-'}
+                        </Text>
+                        <Text style={styles.ocrDebugLabel}>
+                          {language === 'es' ? 'Warnings' : 'Warnings'}
+                        </Text>
+                        <Text style={styles.ocrDebugText}>
+                          {receiptAnalysis.warnings.length > 0
+                            ? receiptAnalysis.warnings.join('\n')
+                            : '-'}
+                        </Text>
+                      </View>
+                    ) : null}
 
-                    <TouchableOpacity style={styles.primaryButton} onPress={onSaveDetectedProducts}>
+                    <Text style={styles.filterLabel}>{language === 'es' ? 'Total a guardar' : 'Total to save'}</Text>
+                    <TextInput
+                      value={receiptTotalInput}
+                      onChangeText={setReceiptTotalInput}
+                      keyboardType="decimal-pad"
+                      style={styles.input}
+                      placeholder={language === 'es' ? 'Edita el total si hace falta' : 'Edit total if needed'}
+                      placeholderTextColor={theme.placeholder}
+                    />
+                    <Text style={styles.helpText}>
+                      {language === 'es'
+                        ? 'Confirma que el total coincida con el comprobante antes de guardar.'
+                        : 'Confirm total matches receipt before saving.'}
+                    </Text>
+
+                    <TouchableOpacity
+                      style={[styles.primaryButton, !canSaveDetectedProducts ? styles.primaryButtonDisabled : undefined]}
+                      onPress={onSaveDetectedProducts}
+                      disabled={!canSaveDetectedProducts}
+                    >
                       <Text style={styles.primaryButtonText}>{t.saveDetectedProducts}</Text>
                     </TouchableOpacity>
                   </View>
@@ -2744,7 +3805,11 @@ export default function App() {
                   placeholderTextColor={theme.placeholder}
                 />
 
-                <TouchableOpacity style={styles.primaryButton} onPress={onSaveExpense}>
+                <TouchableOpacity
+                  style={[styles.primaryButton, !canSaveManualExpense ? styles.primaryButtonDisabled : undefined]}
+                  onPress={onSaveExpense}
+                  disabled={!canSaveManualExpense}
+                >
                   <Text style={styles.primaryButtonText}>{t.saveExpense}</Text>
                 </TouchableOpacity>
               </View>
@@ -2754,7 +3819,7 @@ export default function App() {
               <View style={styles.card}>
                 <View style={styles.totalRow}>
                   <Text style={styles.totalLabel}>{t.total}</Text>
-                  <Text style={styles.totalValue}>{formatCurrency(total, language, numberFormat)}</Text>
+                  <Text style={styles.totalValue}>{displayCurrency(total)}</Text>
                 </View>
 
                 {loading ? (
@@ -2763,6 +3828,9 @@ export default function App() {
                   <FlatList
                     data={expenses}
                     keyExtractor={(item) => item.id.toString()}
+                    initialNumToRender={12}
+                    windowSize={7}
+                    removeClippedSubviews={Platform.OS === 'android'}
                     renderItem={({ item }) => (
                       <View style={styles.itemRow}>
                         <View style={styles.itemTextWrap}>
@@ -2771,7 +3839,7 @@ export default function App() {
                           <Text style={styles.itemDate}>{t.account}: {item.accountName || t.noAccount}</Text>
                           <Text style={styles.itemDate}>{formatDateTime(item.createdAt, dateLocale)}</Text>
                         </View>
-                        <Text style={styles.itemAmount}>{formatCurrency(item.amount, language, numberFormat)}</Text>
+                        <Text style={styles.itemAmount}>{displayCurrency(item.amount)}</Text>
                       </View>
                     )}
                     scrollEnabled={false}
@@ -2786,7 +3854,7 @@ export default function App() {
               <View style={styles.card}>
                 <View style={styles.totalRow}>
                   <Text style={styles.totalLabel}>{t.tabIncomeAdded}</Text>
-                  <Text style={styles.totalValue}>{formatCurrency(totalIncomeAdded, language, numberFormat)}</Text>
+                  <Text style={styles.totalValue}>{displayCurrency(totalIncomeAdded)}</Text>
                 </View>
 
                 {loading ? (
@@ -2795,6 +3863,9 @@ export default function App() {
                   <FlatList
                     data={incomeEntries}
                     keyExtractor={(item) => item.id.toString()}
+                    initialNumToRender={12}
+                    windowSize={7}
+                    removeClippedSubviews={Platform.OS === 'android'}
                     renderItem={({ item }) => (
                       <View style={styles.itemRow}>
                         <View style={styles.itemTextWrap}>
@@ -2802,7 +3873,7 @@ export default function App() {
                           <Text style={styles.itemDate}>{t.account}: {item.accountName || t.noAccount}</Text>
                           <Text style={styles.itemDate}>{formatDateTime(item.createdAt, dateLocale)}</Text>
                         </View>
-                        <Text style={styles.itemAmount}>{formatCurrency(item.amount, language, numberFormat)}</Text>
+                        <Text style={styles.itemAmount}>{displayCurrency(item.amount)}</Text>
                       </View>
                     )}
                     scrollEnabled={false}
@@ -2874,6 +3945,11 @@ export default function App() {
                           ? 'Se usara unicamente "Monto total" con simbolo de colones. Se ignoran telefono, cuenta, referencia, monto y comision.'
                           : 'Only "Total amount" with CRC symbol will be used. Phone, account, reference, amount and fee are ignored.'}
                       </Text>
+                      <Text style={styles.helpText}>
+                        {language === 'es'
+                          ? 'Tip: captura solo el bloque donde aparece "Monto total" para mejorar precision.'
+                          : 'Tip: capture only the section showing "Total amount" for better accuracy.'}
+                      </Text>
 
                       <Text style={styles.filterLabel}>{t.account}</Text>
                       {accounts.length === 0 ? (
@@ -2916,7 +3992,21 @@ export default function App() {
                         textAlignVertical="top"
                       />
 
-                      <TouchableOpacity style={styles.secondaryButton} onPress={onAnalyzeTransferTotal}>
+                      <Text style={styles.filterLabel}>{language === 'es' ? 'Monto total a aplicar' : 'Total amount to apply'}</Text>
+                      <TextInput
+                        value={transferTotalInput}
+                        onChangeText={setTransferTotalInput}
+                        keyboardType="decimal-pad"
+                        style={styles.input}
+                        placeholder={language === 'es' ? 'Edita el total si hace falta' : 'Edit total if needed'}
+                        placeholderTextColor={theme.placeholder}
+                      />
+
+                      <TouchableOpacity
+                        style={[styles.secondaryButton, transferOcrText.trim().length === 0 ? styles.primaryButtonDisabled : undefined]}
+                        onPress={onAnalyzeTransferTotal}
+                        disabled={transferOcrText.trim().length === 0}
+                      >
                         <Text style={styles.secondaryButtonText}>
                           {language === 'es' ? 'Detectar monto total' : 'Detect total amount'}
                         </Text>
@@ -2924,10 +4014,14 @@ export default function App() {
 
                       <View style={styles.summaryRow}>
                         <Text style={styles.summaryLabel}>{language === 'es' ? 'Monto total detectado' : 'Detected total amount'}</Text>
-                        <Text style={styles.summaryValue}>{formatCurrency(transferTotalAmount, language, numberFormat)}</Text>
+                        <Text style={styles.summaryValue}>{displayCurrency(transferTotalAmount)}</Text>
                       </View>
 
-                      <TouchableOpacity style={styles.primaryButton} onPress={onApplyTransferFromCapture}>
+                      <TouchableOpacity
+                        style={[styles.primaryButton, !canApplyTransfer ? styles.primaryButtonDisabled : undefined]}
+                        onPress={onApplyTransferFromCapture}
+                        disabled={!canApplyTransfer}
+                      >
                         <Text style={styles.primaryButtonText}>
                           {transferMode === 'received'
                             ? language === 'es'
@@ -2947,7 +4041,7 @@ export default function App() {
 
           {activeSection === 'transacciones' ? (
             <>
-              {productsByMonthCard}
+              {transactionsCard}
             </>
           ) : null}
 
@@ -2971,6 +4065,11 @@ export default function App() {
                     ? 'Toca para agregar o restar ingresos'
                     : 'Tap to add or subtract income'}
                 </Text>
+                <TouchableOpacity style={styles.secondaryButton} onPress={() => setIsInternalTransferModalVisible(true)}>
+                  <Text style={styles.secondaryButtonText}>
+                    {language === 'es' ? 'Transferencia entre cuentas' : 'Transfer between accounts'}
+                  </Text>
+                </TouchableOpacity>
 
                 {loading ? (
                   <Text style={styles.loading}>{language === 'es' ? 'Cargando cuentas...' : 'Loading accounts...'}</Text>
@@ -2984,8 +4083,15 @@ export default function App() {
                         style={[styles.accountCard, { backgroundColor: account.color }]}
                         onPress={() => onPressAccount(account)}
                       >
-                        <Text style={styles.accountName}>{account.name}</Text>
-                        <Text style={styles.accountBalance}>{formatCurrency(account.balance, language, numberFormat)}</Text>
+                        <View style={styles.accountCardTopRow}>
+                          <Text style={styles.accountName}>{account.name}</Text>
+                          <View style={styles.accountBadge}>
+                            <Text style={styles.accountBadgeText}>{language === 'es' ? 'Disponible' : 'Available'}</Text>
+                          </View>
+                        </View>
+                        <Text style={styles.accountBalance}>
+                          {displayCurrency(account.balance)}
+                        </Text>
                       </TouchableOpacity>
                     ))}
                   </View>
@@ -3030,7 +4136,7 @@ export default function App() {
                             : `Alert: ${warningLevel}% remaining`
                           : null;
                     return (
-                      <View key={`budget-${budget.category}`} style={styles.itemRow}>
+                      <View key={`budget-${budget.category}`} style={[styles.itemRow, styles.budgetItemRow]}>
                         <View style={styles.itemTextWrap}>
                           <View style={styles.budgetCategoryRow}>
                             <View
@@ -3044,20 +4150,34 @@ export default function App() {
                             />
                             <Text style={styles.itemDesc}>{getCategoryLabel(budget.category, language)}</Text>
                           </View>
+                          <View style={styles.budgetProgressTrack}>
+                            <View
+                              style={[
+                                styles.budgetProgressFill,
+                                {
+                                  width: `${Math.min(100, Math.max(0, (spent / Math.max(1, budget.amount)) * 100))}%`,
+                                  backgroundColor:
+                                    remaining <= 0
+                                      ? theme.dangerBorder
+                                      : categoryColorMap[budget.category] ?? DEFAULT_CATEGORY_COLORS[FALLBACK_CATEGORY],
+                                },
+                              ]}
+                            />
+                          </View>
                           <Text style={styles.itemDate}>
-                            {t.maxBudget}: {formatCurrency(budget.amount, language, numberFormat)}
+                            {t.maxBudget}: {displayCurrency(budget.amount)}
                           </Text>
                           <Text style={styles.itemDate}>
-                            {t.monthlySpent}: {formatCurrency(spent, language, numberFormat)}
+                            {t.monthlySpent}: {displayCurrency(spent)}
                           </Text>
                           <Text style={[styles.itemDate, remaining <= 0 ? styles.negativeBudget : undefined]}>
-                            {t.remainingBudget}: {formatCurrency(remaining, language, numberFormat)}
+                            {t.remainingBudget}: {displayCurrency(remaining)}
                           </Text>
                           {warningText ? (
                             <Text style={styles.budgetWarningText}>{warningText}</Text>
                           ) : null}
                         </View>
-                        <View style={styles.productActionWrap}>
+                        <View style={[styles.productActionWrap, styles.budgetActionsWrap]}>
                           <TouchableOpacity
                             style={styles.deleteTableButton}
                             onPress={() => onDeleteBudget(budget.category)}
@@ -3125,10 +4245,56 @@ export default function App() {
 
           {activeSection === 'configuracion' ? (
             <View style={styles.card}>
+              <Text style={styles.filterLabel}>{language === 'es' ? 'Privacidad' : 'Privacy'}</Text>
+              <TouchableOpacity style={styles.secondaryButton} onPress={() => void onToggleHideAmounts()}>
+                <Text style={styles.secondaryButtonText}>
+                  {hideAmounts
+                    ? language === 'es'
+                      ? 'Mostrar montos'
+                      : 'Show amounts'
+                    : language === 'es'
+                      ? 'Ocultar montos'
+                      : 'Hide amounts'}
+                </Text>
+              </TouchableOpacity>
+
+              <Text style={styles.filterLabel}>{language === 'es' ? 'Bloqueo por PIN' : 'PIN lock'}</Text>
+              <TextInput
+                value={pinInput}
+                onChangeText={setPinInput}
+                placeholder={language === 'es' ? 'PIN (4-8 digitos)' : 'PIN (4-8 digits)'}
+                keyboardType="number-pad"
+                style={styles.input}
+                placeholderTextColor={theme.placeholder}
+                secureTextEntry
+              />
+              <View style={styles.modalOptionRow}>
+                <TouchableOpacity style={styles.secondaryButtonCompact} onPress={() => void onSavePin()}>
+                  <Text style={styles.secondaryButtonText}>{language === 'es' ? 'Guardar PIN' : 'Save PIN'}</Text>
+                </TouchableOpacity>
+                <TouchableOpacity style={styles.secondaryButtonCompact} onPress={() => void onToggleAppLock()}>
+                  <Text style={styles.secondaryButtonText}>
+                    {appLockEnabled ? (language === 'es' ? 'Desactivar bloqueo' : 'Disable lock') : (language === 'es' ? 'Activar bloqueo' : 'Enable lock')}
+                  </Text>
+                </TouchableOpacity>
+              </View>
+
               <Text style={styles.filterLabel}>{t.reportError}</Text>
               <TouchableOpacity style={styles.secondaryButton} onPress={onContactPress}>
                 <Text style={styles.secondaryButtonText}>{t.contact}</Text>
               </TouchableOpacity>
+              <Text style={styles.filterLabel}>{language === 'es' ? 'Respaldo local' : 'Local backup'}</Text>
+              <View style={styles.modalOptionRow}>
+                <TouchableOpacity style={styles.secondaryButtonCompact} onPress={() => void onExportBackup()}>
+                  <Text style={styles.secondaryButtonText}>{language === 'es' ? 'Exportar backup' : 'Export backup'}</Text>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  style={styles.secondaryButtonCompact}
+                  onPress={() => setIsRestoreBackupModalVisible(true)}
+                >
+                  <Text style={styles.secondaryButtonText}>{language === 'es' ? 'Restaurar backup' : 'Restore backup'}</Text>
+                </TouchableOpacity>
+              </View>
               <Text style={styles.filterLabel}>{t.language}</Text>
               <View style={styles.languageRow}>
                 <TouchableOpacity
@@ -3596,6 +4762,122 @@ export default function App() {
           </View>
         </View>
       </Modal>
+
+      <Modal
+        visible={isInternalTransferModalVisible}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setIsInternalTransferModalVisible(false)}
+      >
+        <View style={styles.modalBackdrop}>
+          <View style={styles.modalCard}>
+            <Text style={styles.sectionTitle}>
+              {language === 'es' ? 'Transferencia entre cuentas' : 'Transfer between accounts'}
+            </Text>
+            <Text style={styles.filterLabel}>{language === 'es' ? 'Cuenta origen' : 'From account'}</Text>
+            <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.chipScroll}>
+              {accounts.map((account) => (
+                <TouchableOpacity
+                  key={`it-from-${account.id}`}
+                  style={[styles.filterChip, internalTransferFromId === account.id ? styles.filterChipActive : undefined]}
+                  onPress={() => setInternalTransferFromId(account.id)}
+                >
+                  <Text style={[styles.filterChipText, internalTransferFromId === account.id ? styles.filterChipTextActive : undefined]}>
+                    {account.name}
+                  </Text>
+                </TouchableOpacity>
+              ))}
+            </ScrollView>
+
+            <Text style={styles.filterLabel}>{language === 'es' ? 'Cuenta destino' : 'To account'}</Text>
+            <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.chipScroll}>
+              {accounts.map((account) => (
+                <TouchableOpacity
+                  key={`it-to-${account.id}`}
+                  style={[styles.filterChip, internalTransferToId === account.id ? styles.filterChipActive : undefined]}
+                  onPress={() => setInternalTransferToId(account.id)}
+                >
+                  <Text style={[styles.filterChipText, internalTransferToId === account.id ? styles.filterChipTextActive : undefined]}>
+                    {account.name}
+                  </Text>
+                </TouchableOpacity>
+              ))}
+            </ScrollView>
+
+            <TextInput
+              value={internalTransferAmount}
+              onChangeText={setInternalTransferAmount}
+              placeholder={language === 'es' ? 'Monto' : 'Amount'}
+              keyboardType="decimal-pad"
+              style={styles.input}
+              placeholderTextColor={theme.placeholder}
+            />
+
+            <TouchableOpacity style={styles.primaryButton} onPress={() => void onApplyInternalTransfer()}>
+              <Text style={styles.primaryButtonText}>{language === 'es' ? 'Aplicar transferencia' : 'Apply transfer'}</Text>
+            </TouchableOpacity>
+            <TouchableOpacity style={styles.secondaryButton} onPress={() => setIsInternalTransferModalVisible(false)}>
+              <Text style={styles.secondaryButtonText}>{language === 'es' ? 'Cerrar' : 'Close'}</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      </Modal>
+
+      <Modal visible={appLockEnabled && !isUnlocked} transparent animationType="fade">
+        <View style={styles.modalBackdrop}>
+          <View style={styles.modalCard}>
+            <Text style={styles.sectionTitle}>{language === 'es' ? 'MyFinance bloqueada' : 'MyFinance locked'}</Text>
+            <Text style={styles.helpText}>
+              {language === 'es' ? 'Ingresa tu PIN para continuar.' : 'Enter your PIN to continue.'}
+            </Text>
+            <TextInput
+              value={pinInput}
+              onChangeText={setPinInput}
+              placeholder={language === 'es' ? 'PIN' : 'PIN'}
+              keyboardType="number-pad"
+              style={styles.input}
+              placeholderTextColor={theme.placeholder}
+              secureTextEntry
+            />
+            <TouchableOpacity style={styles.primaryButton} onPress={onUnlockApp}>
+              <Text style={styles.primaryButtonText}>{language === 'es' ? 'Desbloquear' : 'Unlock'}</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      </Modal>
+
+      <Modal
+        visible={isRestoreBackupModalVisible}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setIsRestoreBackupModalVisible(false)}
+      >
+        <View style={styles.modalBackdrop}>
+          <View style={styles.modalCard}>
+            <Text style={styles.sectionTitle}>{language === 'es' ? 'Restaurar backup' : 'Restore backup'}</Text>
+            <Text style={styles.helpText}>
+              {language === 'es'
+                ? 'Pega aqui el JSON exportado por la app.'
+                : 'Paste the JSON exported by the app here.'}
+            </Text>
+            <TextInput
+              multiline
+              value={backupJsonInput}
+              onChangeText={setBackupJsonInput}
+              style={styles.ocrInput}
+              placeholder={language === 'es' ? 'Pega el JSON...' : 'Paste JSON...'}
+              placeholderTextColor={theme.placeholder}
+              textAlignVertical="top"
+            />
+            <TouchableOpacity style={styles.primaryButton} onPress={() => void onRestoreBackup()}>
+              <Text style={styles.primaryButtonText}>{language === 'es' ? 'Validar y restaurar' : 'Validate and restore'}</Text>
+            </TouchableOpacity>
+            <TouchableOpacity style={styles.secondaryButton} onPress={() => setIsRestoreBackupModalVisible(false)}>
+              <Text style={styles.secondaryButtonText}>{language === 'es' ? 'Cerrar' : 'Close'}</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      </Modal>
       </Animated.View>
     </SafeAreaView>
   );
@@ -3615,114 +4897,193 @@ function createStyles(theme: AppTheme) {
     flex: 1,
   },
   container: {
-    paddingHorizontal: 16,
-    paddingTop: 14,
-    paddingBottom: 20,
-    gap: 12,
+    paddingHorizontal: uiSpacing.md,
+    paddingTop: uiSpacing.md,
+    paddingBottom: uiSpacing.xl,
+    gap: uiSpacing.md,
   },
   headerRow: {
     flexDirection: 'row',
     alignItems: 'center',
-    gap: 10,
+    gap: uiSpacing.sm,
+    marginBottom: uiSpacing.sm,
   },
   menuButton: {
-    width: 34,
-    height: 34,
-    borderRadius: 10,
+    width: uiHeight.iconButton,
+    height: uiHeight.iconButton,
+    borderRadius: uiRadius.md,
     borderWidth: 1,
-    borderColor: theme.border,
+    borderColor: theme.borderStrong,
     backgroundColor: theme.surfaceAlt,
     alignItems: 'center',
     justifyContent: 'center',
+    ...uiElevation.card,
   },
   menuIcon: {
     color: theme.text,
-    fontSize: 18,
+    fontSize: 17,
     lineHeight: 18,
     fontWeight: '700',
   },
+  headerTitleWrap: {
+    flex: 1,
+  },
   title: {
-    fontSize: 28,
-    fontWeight: '700',
-    color: theme.textSoft,
+    fontSize: uiTypography.title,
+    fontWeight: '800',
+    color: theme.text,
+    letterSpacing: 0.3,
+  },
+  headerCaption: {
+    color: theme.textMuted,
+    fontSize: uiTypography.caption,
+    marginTop: 1,
   },
   subtitle: {
     color: theme.textMuted,
-    marginBottom: 4,
+    marginBottom: uiSpacing.sm,
+    marginTop: -1,
+    fontSize: uiTypography.caption,
+    lineHeight: 18,
   },
-  topSummaryRow: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    gap: 10,
-  },
-  leftSummaryColumn: {
-    flex: 1,
-    gap: 10,
-  },
-  accountsTotalCard: {
+  homeHeroCard: {
     backgroundColor: theme.surfaceAlt,
     borderWidth: 1,
     borderColor: theme.borderStrong,
-    borderRadius: 12,
-    paddingVertical: 8,
-    paddingHorizontal: 10,
+    borderRadius: uiRadius.lg,
+    padding: uiSpacing.lg,
+    gap: uiSpacing.xs,
+    ...uiElevation.card,
+  },
+  homeHeroLabel: {
+    color: theme.textMuted,
+    fontSize: uiTypography.caption,
+    fontWeight: '700',
+  },
+  homeHeroValue: {
+    color: theme.text,
+    fontSize: 28,
+    fontWeight: '800',
+    letterSpacing: 0.3,
+  },
+  homeHeroSubLabel: {
+    color: theme.textMuted,
+    fontSize: uiTypography.caption,
+  },
+  homeMetricsRow: {
+    flexDirection: 'row',
+    gap: uiSpacing.sm,
+  },
+  homeMetricCard: {
     flex: 1,
+    backgroundColor: theme.surfaceAlt,
+    borderWidth: 1,
+    borderColor: theme.borderStrong,
+    borderRadius: uiRadius.md,
+    paddingVertical: uiSpacing.sm,
+    paddingHorizontal: uiSpacing.sm,
+    minHeight: 106,
+    ...uiElevation.card,
   },
-  leftSummaryCard: {
-    alignSelf: 'flex-start',
+  homeSummaryGrid: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: uiSpacing.sm,
   },
-  rightSummaryCard: {
-    alignSelf: 'flex-start',
+  homeSummaryCard: {
+    width: '48%',
+    backgroundColor: theme.surfaceAlt,
+    borderWidth: 1,
+    borderColor: theme.borderStrong,
+    borderRadius: uiRadius.md,
+    paddingVertical: uiSpacing.sm,
+    paddingHorizontal: uiSpacing.sm,
+    minHeight: 96,
+    justifyContent: 'space-between',
+    gap: uiSpacing.xxs,
+    ...uiElevation.card,
+  },
+  homeSummaryCardFull: {
+    width: '100%',
+  },
+  homeSummaryLabel: {
+    color: theme.textMuted,
+    fontSize: uiTypography.caption,
+    fontWeight: '700',
+  },
+  homeSummaryText: {
+    color: theme.textSoft,
+    fontSize: uiTypography.caption,
+    fontWeight: '600',
+  },
+  homeSummaryValue: {
+    color: theme.text,
+    fontSize: uiTypography.section,
+    fontWeight: '800',
+  },
+  homeNoDataText: {
+    color: theme.textMuted,
+    fontSize: uiTypography.body,
+    fontWeight: '600',
+    marginTop: uiSpacing.xxs,
   },
   accountsTotalLabel: {
     color: theme.textMuted,
-    fontSize: 12,
+    fontSize: uiTypography.caption,
     fontWeight: '600',
   },
   hormigaName: {
     color: theme.text,
-    fontSize: 14,
+    fontSize: uiTypography.body,
     fontWeight: '700',
-    marginTop: 2,
+    marginTop: 3,
   },
   accountsTotalValue: {
     color: theme.text,
-    fontSize: 16,
-    fontWeight: '700',
-    marginTop: 2,
+    fontSize: uiTypography.section,
+    fontWeight: '800',
+    marginTop: 4,
   },
   card: {
     backgroundColor: theme.surface,
-    borderRadius: 14,
-    padding: 12,
-    gap: 10,
+    borderRadius: uiRadius.md,
+    padding: uiSpacing.md,
+    gap: uiSpacing.md,
     borderWidth: 1,
-    borderColor: theme.border,
+    borderColor: theme.borderStrong,
+    ...uiElevation.card,
+  },
+  homeChartCard: {
+    paddingTop: uiSpacing.md,
   },
   sectionTitle: {
-    fontSize: 16,
-    fontWeight: '700',
+    fontSize: uiTypography.section,
+    fontWeight: '800',
     color: theme.text,
+    letterSpacing: 0.25,
+    marginBottom: uiSpacing.xxs,
   },
   filterWrap: {
-    gap: 8,
+    gap: uiSpacing.xs,
   },
   filterLabel: {
     color: theme.textMuted,
-    fontSize: 12,
-    fontWeight: '600',
+    fontSize: uiTypography.caption,
+    fontWeight: '700',
+    letterSpacing: 0.2,
   },
   chipScroll: {
-    marginBottom: 2,
+    marginBottom: uiSpacing.xs,
   },
   filterChip: {
     borderWidth: 1,
-    borderColor: theme.placeholder,
-    paddingHorizontal: 10,
-    paddingVertical: 7,
-    borderRadius: 999,
-    marginRight: 8,
-    backgroundColor: theme.background,
+    borderColor: theme.border,
+    paddingHorizontal: uiSpacing.sm,
+    minHeight: uiHeight.chip,
+    borderRadius: uiRadius.pill,
+    marginRight: uiSpacing.xs,
+    backgroundColor: theme.surfaceAlt,
+    justifyContent: 'center',
   },
   filterChipActive: {
     borderColor: theme.accentStrong,
@@ -3730,7 +5091,8 @@ function createStyles(theme: AppTheme) {
   },
   filterChipText: {
     color: theme.textSoft,
-    fontSize: 12,
+    fontSize: uiTypography.caption,
+    fontWeight: '600',
   },
   filterChipTextActive: {
     color: theme.accentText,
@@ -3740,8 +5102,8 @@ function createStyles(theme: AppTheme) {
     width: 34,
     height: 34,
     borderRadius: 17,
-    marginRight: 8,
-    marginBottom: 8,
+    marginRight: uiSpacing.xs,
+    marginBottom: uiSpacing.xs,
     borderWidth: 2,
     borderColor: theme.background,
   },
@@ -3751,10 +5113,10 @@ function createStyles(theme: AppTheme) {
   colorTableWrap: {
     borderWidth: 1,
     borderColor: theme.border,
-    borderRadius: 10,
-    padding: 8,
+    borderRadius: uiRadius.md,
+    padding: uiSpacing.xs,
     backgroundColor: theme.background,
-    gap: 8,
+    gap: uiSpacing.xs,
   },
   colorGroup: {
     gap: 6,
@@ -3772,11 +5134,11 @@ function createStyles(theme: AppTheme) {
     flexDirection: 'row',
     alignItems: 'center',
     borderWidth: 1,
-    borderColor: theme.placeholder,
-    borderRadius: 10,
-    backgroundColor: theme.background,
-    paddingHorizontal: 10,
-    minHeight: 42,
+    borderColor: theme.border,
+    borderRadius: uiRadius.md,
+    backgroundColor: theme.inputBg,
+    paddingHorizontal: uiSpacing.sm,
+    minHeight: uiHeight.input,
   },
   searchIcon: {
     color: theme.textMuted,
@@ -3785,17 +5147,18 @@ function createStyles(theme: AppTheme) {
   },
   searchInput: {
     flex: 1,
-    color: theme.textSoft,
+    color: theme.text,
+    fontSize: uiTypography.body,
   },
   predictionList: {
     borderWidth: 1,
     borderColor: theme.border,
-    borderRadius: 10,
+    borderRadius: uiRadius.md,
     overflow: 'hidden',
   },
   predictionItem: {
-    paddingVertical: 10,
-    paddingHorizontal: 12,
+    paddingVertical: uiSpacing.sm,
+    paddingHorizontal: uiSpacing.sm,
     backgroundColor: theme.background,
     borderBottomWidth: 1,
     borderBottomColor: theme.border,
@@ -3805,67 +5168,91 @@ function createStyles(theme: AppTheme) {
   },
   helpText: {
     color: theme.textMuted,
-    fontSize: 12,
+    fontSize: uiTypography.caption,
+    lineHeight: 20,
   },
   input: {
     borderWidth: 1,
-    borderColor: theme.placeholder,
-    borderRadius: 10,
-    paddingHorizontal: 12,
-    paddingVertical: 10,
-    color: theme.textSoft,
-    backgroundColor: theme.background,
+    borderColor: theme.border,
+    borderRadius: uiRadius.md,
+    paddingHorizontal: uiSpacing.sm,
+    minHeight: uiHeight.input,
+    color: theme.text,
+    backgroundColor: theme.inputBg,
+    fontSize: uiTypography.body,
   },
   ocrInput: {
     borderWidth: 1,
-    borderColor: theme.placeholder,
-    borderRadius: 10,
-    paddingHorizontal: 12,
-    paddingVertical: 10,
-    color: theme.textSoft,
-    backgroundColor: theme.background,
+    borderColor: theme.border,
+    borderRadius: uiRadius.md,
+    paddingHorizontal: uiSpacing.sm,
+    paddingVertical: uiSpacing.sm,
+    color: theme.text,
+    backgroundColor: theme.inputBg,
     minHeight: 140,
+    fontSize: uiTypography.body,
+    lineHeight: 21,
   },
   previewImage: {
     width: '100%',
-    height: 180,
-    borderRadius: 10,
+    height: 190,
+    borderRadius: uiRadius.md,
     borderWidth: 1,
-    borderColor: theme.placeholder,
+    borderColor: theme.border,
   },
   primaryButton: {
     backgroundColor: theme.accent,
-    borderRadius: 10,
-    paddingVertical: 12,
+    borderRadius: uiRadius.md,
+    minHeight: uiHeight.button,
     alignItems: 'center',
+    justifyContent: 'center',
+    paddingHorizontal: uiSpacing.md,
+    borderWidth: 1,
+    borderColor: theme.accentStrong,
+    ...uiElevation.card,
   },
   primaryButtonDisabled: {
     opacity: 0.5,
   },
   primaryButtonText: {
     color: theme.accentText,
-    fontWeight: '600',
+    fontWeight: '800',
+    fontSize: uiTypography.body,
+    letterSpacing: 0.15,
+    textAlign: 'center',
+    width: '100%',
+    includeFontPadding: false,
+    lineHeight: 19,
   },
   secondaryButton: {
-    borderColor: theme.placeholder,
+    borderColor: theme.border,
     borderWidth: 1,
-    borderRadius: 10,
-    paddingVertical: 12,
+    borderRadius: uiRadius.md,
+    minHeight: uiHeight.button,
     alignItems: 'center',
-    backgroundColor: theme.background,
+    justifyContent: 'center',
+    backgroundColor: theme.surfaceAlt,
+    paddingHorizontal: uiSpacing.md,
   },
   secondaryButtonText: {
-    color: theme.textSoft,
-    fontWeight: '600',
+    color: theme.text,
+    fontWeight: '700',
+    fontSize: uiTypography.body,
+    textAlign: 'center',
+    width: '100%',
+    includeFontPadding: false,
+    lineHeight: 19,
   },
   secondaryButtonCompact: {
     flex: 1,
-    borderColor: theme.placeholder,
+    borderColor: theme.border,
     borderWidth: 1,
-    borderRadius: 10,
-    paddingVertical: 10,
+    borderRadius: uiRadius.md,
+    minHeight: uiHeight.buttonCompact,
     alignItems: 'center',
-    backgroundColor: theme.background,
+    justifyContent: 'center',
+    backgroundColor: theme.surfaceAlt,
+    paddingHorizontal: uiSpacing.sm,
   },
   colorEditCircleButton: {
     width: 38,
@@ -3886,43 +5273,55 @@ function createStyles(theme: AppTheme) {
   },
   categoryActionRow: {
     flexDirection: 'row',
-    gap: 8,
+    gap: uiSpacing.xs,
   },
   deleteCategoryButton: {
     flex: 1,
     borderColor: theme.dangerBorder,
     borderWidth: 1,
-    borderRadius: 10,
-    paddingVertical: 10,
+    borderRadius: uiRadius.md,
+    minHeight: uiHeight.buttonCompact,
     alignItems: 'center',
+    justifyContent: 'center',
     backgroundColor: theme.dangerBg,
   },
   deleteActionButtonFull: {
     borderColor: theme.dangerBorder,
     borderWidth: 1,
-    borderRadius: 10,
-    paddingVertical: 10,
+    borderRadius: uiRadius.md,
+    minHeight: uiHeight.button,
     alignItems: 'center',
+    justifyContent: 'center',
     backgroundColor: theme.dangerBg,
   },
   deleteCategoryButtonText: {
     color: theme.dangerText,
     fontWeight: '700',
+    textAlign: 'center',
+    width: '100%',
+    includeFontPadding: false,
+    lineHeight: 18,
   },
   clearButton: {
     borderColor: theme.dangerBorder,
     borderWidth: 1,
-    borderRadius: 10,
-    paddingVertical: 10,
+    borderRadius: uiRadius.md,
+    minHeight: uiHeight.buttonCompact,
     alignItems: 'center',
+    justifyContent: 'center',
     backgroundColor: theme.dangerBg,
   },
   clearButtonText: {
     color: theme.dangerText,
     fontWeight: '700',
+    textAlign: 'center',
+    width: '100%',
+    includeFontPadding: false,
+    lineHeight: 18,
   },
   analysisWrap: {
-    gap: 8,
+    gap: uiSpacing.xs,
+    paddingTop: uiSpacing.xxs,
   },
   chartWrap: {
     alignItems: 'center',
@@ -3950,12 +5349,12 @@ function createStyles(theme: AppTheme) {
     fontWeight: '700',
   },
   legendWrap: {
-    gap: 8,
+    gap: uiSpacing.xs,
   },
   legendRow: {
     flexDirection: 'row',
     alignItems: 'center',
-    gap: 8,
+    gap: uiSpacing.xs,
   },
   legendDot: {
     width: 10,
@@ -3972,51 +5371,13 @@ function createStyles(theme: AppTheme) {
     fontSize: 12,
   },
   expenseTopTabs: {
-    gap: 8,
-  },
-  expenseTopTabsScrollContent: {
-    flexDirection: 'row',
-    gap: 8,
-    paddingRight: 12,
-  },
-  expenseTopTab: {
-    flexShrink: 0,
-    borderWidth: 1,
-    borderColor: theme.border,
-    backgroundColor: theme.surfaceAlt,
-    borderRadius: 10,
-    paddingVertical: 10,
-    paddingHorizontal: 12,
-    alignItems: 'center',
-  },
-  expenseTopTabActive: {
-    borderColor: theme.accentStrong,
-    backgroundColor: theme.navActiveBg,
-  },
-  expenseTopTabText: {
-    color: theme.textSoft,
-    fontSize: 12,
-    fontWeight: '700',
-  },
-  expenseTopTabTextActive: {
-    color: theme.accentText,
-  },
-  expenseTopTabsHintTrack: {
-    alignSelf: 'center',
-    width: 56,
-    height: 4,
-    borderRadius: 999,
-    backgroundColor: theme.border,
-    overflow: 'hidden',
-  },
-  expenseTopTabsHintThumb: {
-    height: 4,
-    borderRadius: 999,
-    backgroundColor: theme.textMuted,
+    gap: uiSpacing.xs,
   },
   summaryRow: {
     flexDirection: 'row',
     justifyContent: 'space-between',
+    alignItems: 'center',
+    gap: uiSpacing.xs,
   },
   summaryLabel: {
     color: theme.textMuted,
@@ -4026,9 +5387,45 @@ function createStyles(theme: AppTheme) {
     color: theme.text,
     fontWeight: '700',
   },
+  receiptWarningsBox: {
+    borderWidth: 1,
+    borderColor: theme.border,
+    backgroundColor: theme.surfaceAlt,
+    borderRadius: uiRadius.md,
+    paddingHorizontal: uiSpacing.sm,
+    paddingVertical: uiSpacing.xs,
+    gap: uiSpacing.xxs,
+  },
+  receiptWarningText: {
+    color: theme.textMuted,
+    fontSize: uiTypography.caption,
+  },
+  ocrDebugBox: {
+    borderWidth: 1,
+    borderColor: theme.borderStrong,
+    backgroundColor: theme.surface,
+    borderRadius: uiRadius.md,
+    paddingHorizontal: uiSpacing.sm,
+    paddingVertical: uiSpacing.sm,
+    gap: uiSpacing.xxs,
+  },
+  ocrDebugTitle: {
+    color: theme.text,
+    fontWeight: '700',
+    fontSize: uiTypography.body,
+  },
+  ocrDebugLabel: {
+    color: theme.textMuted,
+    fontWeight: '600',
+    marginTop: uiSpacing.xxs,
+  },
+  ocrDebugText: {
+    color: theme.textSoft,
+    fontSize: uiTypography.caption,
+  },
   monthGroup: {
-    gap: 8,
-    marginBottom: 8,
+    gap: uiSpacing.xs,
+    marginBottom: uiSpacing.xs,
   },
   monthTitle: {
     color: theme.text,
@@ -4089,24 +5486,30 @@ function createStyles(theme: AppTheme) {
   deleteTableButton: {
     borderWidth: 1,
     borderColor: theme.dangerBorder,
-    borderRadius: 6,
-    paddingVertical: 4,
-    paddingHorizontal: 8,
+    borderRadius: uiRadius.sm,
+    minHeight: 30,
+    paddingHorizontal: uiSpacing.xs,
     alignItems: 'center',
+    justifyContent: 'center',
     backgroundColor: theme.dangerBg,
   },
   deleteTableButtonText: {
     color: theme.dangerText,
     fontSize: 12,
     fontWeight: '700',
+    textAlign: 'center',
+    width: '100%',
+    includeFontPadding: false,
+    lineHeight: 15,
   },
   adjustBudgetInlineButton: {
     borderColor: theme.placeholder,
     borderWidth: 1,
-    borderRadius: 6,
-    paddingVertical: 4,
-    paddingHorizontal: 8,
+    borderRadius: uiRadius.sm,
+    minHeight: 30,
+    paddingHorizontal: uiSpacing.xs,
     alignItems: 'center',
+    justifyContent: 'center',
     backgroundColor: theme.background,
   },
   totalRow: {
@@ -4121,29 +5524,37 @@ function createStyles(theme: AppTheme) {
   totalValue: {
     color: theme.text,
     fontWeight: '700',
-    fontSize: 16,
+    fontSize: uiTypography.section,
   },
   loading: {
     color: theme.textMuted,
   },
   itemRow: {
-    backgroundColor: theme.background,
+    backgroundColor: theme.surfaceAlt,
     borderWidth: 1,
     borderColor: theme.border,
-    borderRadius: 12,
-    padding: 12,
-    marginBottom: 8,
+    borderRadius: uiRadius.md,
+    padding: uiSpacing.md,
+    marginBottom: uiSpacing.xs,
     flexDirection: 'row',
-    alignItems: 'center',
+    alignItems: 'flex-start',
     justifyContent: 'space-between',
-    gap: 12,
+    gap: uiSpacing.sm,
+  },
+  budgetItemRow: {
+    backgroundColor: theme.surfaceAlt,
+    borderColor: theme.borderStrong,
   },
   productActionWrap: {
     alignItems: 'flex-end',
-    gap: 8,
+    gap: uiSpacing.xs,
+  },
+  budgetActionsWrap: {
+    minWidth: 116,
   },
   itemTextWrap: {
     flex: 1,
+    gap: 2,
   },
   budgetCategoryRow: {
     flexDirection: 'row',
@@ -4156,27 +5567,27 @@ function createStyles(theme: AppTheme) {
     borderRadius: 5,
   },
   itemDesc: {
-    fontSize: 15,
+    fontSize: uiTypography.body,
     color: theme.text,
-    fontWeight: '600',
+    fontWeight: '700',
   },
   itemDate: {
     marginTop: 2,
     color: theme.textMuted,
-    fontSize: 12,
+    fontSize: uiTypography.caption,
   },
   itemAmount: {
-    fontWeight: '700',
+    fontWeight: '800',
     color: theme.amountColor,
-    fontSize: 15,
+    fontSize: uiTypography.body,
   },
   accountGrid: {
-    gap: 10,
+    gap: uiSpacing.sm,
   },
   accountsHeaderRow: {
     flexDirection: 'row',
     alignItems: 'center',
-    gap: 10,
+    gap: uiSpacing.sm,
   },
   addCircleButton: {
     width: 34,
@@ -4195,22 +5606,55 @@ function createStyles(theme: AppTheme) {
     fontWeight: '700',
   },
   accountCard: {
-    borderRadius: 12,
-    paddingVertical: 14,
-    paddingHorizontal: 14,
+    borderRadius: uiRadius.md,
+    paddingVertical: uiSpacing.md,
+    paddingHorizontal: uiSpacing.md,
     borderWidth: 1,
     borderColor: theme.surfaceAlt,
+    gap: uiSpacing.xs,
+    ...uiElevation.card,
+  },
+  accountCardTopRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: uiSpacing.xs,
+  },
+  accountBadge: {
+    borderRadius: uiRadius.pill,
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.24)',
+    backgroundColor: 'rgba(15,23,42,0.18)',
+    paddingHorizontal: uiSpacing.xs,
+    minHeight: 24,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  accountBadgeText: {
+    color: theme.textSoft,
+    fontSize: uiTypography.tiny,
+    fontWeight: '700',
   },
   accountName: {
     color: theme.text,
-    fontWeight: '700',
-    fontSize: 16,
-    marginBottom: 4,
+    fontWeight: '800',
+    fontSize: uiTypography.body,
   },
   accountBalance: {
-    color: theme.textSoft,
-    fontWeight: '700',
-    fontSize: 15,
+    color: theme.text,
+    fontWeight: '800',
+    fontSize: uiTypography.section,
+  },
+  budgetProgressTrack: {
+    height: 8,
+    borderRadius: uiRadius.pill,
+    backgroundColor: theme.border,
+    marginTop: uiSpacing.xs,
+    overflow: 'hidden',
+  },
+  budgetProgressFill: {
+    height: 8,
+    borderRadius: uiRadius.pill,
   },
   emptyWrap: {
     flexGrow: 1,
@@ -4219,6 +5663,13 @@ function createStyles(theme: AppTheme) {
   empty: {
     textAlign: 'center',
     color: theme.textMuted,
+    backgroundColor: theme.surfaceAlt,
+    borderWidth: 1,
+    borderColor: theme.border,
+    borderRadius: uiRadius.md,
+    paddingVertical: uiSpacing.md,
+    paddingHorizontal: uiSpacing.sm,
+    overflow: 'hidden',
   },
   configNotice: {
     borderWidth: 1,
@@ -4244,17 +5695,17 @@ function createStyles(theme: AppTheme) {
   },
   languageRow: {
     flexDirection: 'row',
-    gap: 8,
+    gap: uiSpacing.xs,
   },
   numberFormatRow: {
     flexDirection: 'row',
     flexWrap: 'wrap',
-    gap: 8,
+    gap: uiSpacing.xs,
   },
   drawerOverlay: {
     ...StyleSheet.absoluteFillObject,
     zIndex: 30,
-    backgroundColor: 'rgba(0, 0, 0, 0.34)',
+    backgroundColor: 'rgba(0, 0, 0, 0.46)',
   },
   drawerBackdropTouch: {
     ...StyleSheet.absoluteFillObject,
@@ -4265,9 +5716,10 @@ function createStyles(theme: AppTheme) {
     backgroundColor: theme.surfaceAlt,
     borderRightWidth: 1,
     borderRightColor: theme.border,
-    paddingTop: 16,
-    paddingHorizontal: 12,
-    gap: 8,
+    paddingTop: uiSpacing.lg,
+    paddingHorizontal: uiSpacing.sm,
+    gap: uiSpacing.sm,
+    ...uiElevation.modal,
   },
   drawerTitle: {
     color: theme.text,
@@ -4278,10 +5730,10 @@ function createStyles(theme: AppTheme) {
   drawerItem: {
     borderWidth: 1,
     borderColor: theme.border,
-    borderRadius: 10,
-    backgroundColor: theme.background,
-    paddingVertical: 12,
-    paddingHorizontal: 12,
+    borderRadius: uiRadius.md,
+    backgroundColor: theme.surface,
+    paddingVertical: uiSpacing.sm,
+    paddingHorizontal: uiSpacing.sm,
   },
   drawerItemRow: {
     flexDirection: 'row',
@@ -4347,6 +5799,8 @@ function createStyles(theme: AppTheme) {
     fontWeight: '600',
     fontSize: 10,
     textAlign: 'center',
+    includeFontPadding: false,
+    lineHeight: 12,
   },
   navButtonTextActive: {
     color: theme.accentText,
@@ -4356,22 +5810,23 @@ function createStyles(theme: AppTheme) {
     flex: 1,
     backgroundColor: theme.modalBackdrop,
     justifyContent: 'center',
-    padding: 16,
+    padding: uiSpacing.md,
   },
   modalCard: {
     backgroundColor: theme.surface,
-    borderRadius: 14,
-    padding: 14,
+    borderRadius: uiRadius.lg,
+    padding: uiSpacing.lg,
     borderWidth: 1,
-    borderColor: theme.border,
-    gap: 10,
+    borderColor: theme.borderStrong,
+    gap: uiSpacing.sm,
+    ...uiElevation.modal,
   },
   modalCardScrollable: {
-    maxHeight: '85%',
+    maxHeight: '90%',
   },
   modalOptionRow: {
     flexDirection: 'row',
-    gap: 8,
+    gap: uiSpacing.xs,
   },
   negativeBudget: {
     color: '#fca5a5',
@@ -4385,3 +5840,6 @@ function createStyles(theme: AppTheme) {
   },
   });
 }
+
+
+

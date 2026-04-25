@@ -72,7 +72,12 @@ export async function listProducts(): Promise<StoredProduct[]> {
     account_name: string;
     created_at: string;
   }>(
-    'SELECT id, name, category, quantity, unit_price, line_total, account_name, created_at FROM products ORDER BY created_at DESC, id DESC'
+    `
+      SELECT id, name, category, quantity, unit_price, line_total, account_name, created_at
+      FROM products
+      WHERE COALESCE(is_deleted, 0) = 0
+      ORDER BY created_at DESC, id DESC
+    `
   );
 
   return rows.map((row) => ({
@@ -89,7 +94,11 @@ export async function listProducts(): Promise<StoredProduct[]> {
 
 export async function deleteProductById(id: number): Promise<void> {
   const db = await getDb();
-  await db.runAsync('DELETE FROM products WHERE id = ?', id);
+  await db.runAsync(
+    "UPDATE products SET is_deleted = 1, deleted_at = ? WHERE id = ?",
+    new Date().toISOString(),
+    id
+  );
 }
 
 export async function syncProductsFromExpenses(): Promise<void> {

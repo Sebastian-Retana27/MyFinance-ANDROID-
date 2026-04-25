@@ -7,6 +7,9 @@ export type AppNumberFormat = 'none' | 'comma' | 'dot_comma' | 'space_dot' | 'sp
 const LANGUAGE_KEY = 'app_language';
 const THEME_MODE_KEY = 'app_theme_mode';
 const NUMBER_FORMAT_KEY = 'app_number_format';
+const HIDE_AMOUNTS_KEY = 'hide_amounts';
+const APP_PIN_KEY = 'app_pin';
+const APP_LOCK_ENABLED_KEY = 'app_lock_enabled';
 
 export async function getSavedLanguage(): Promise<AppLanguage> {
   const db = await getDb();
@@ -78,5 +81,53 @@ export async function saveNumberFormat(format: AppNumberFormat): Promise<void> {
     'INSERT INTO app_meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value',
     NUMBER_FORMAT_KEY,
     format
+  );
+}
+
+export async function getHideAmounts(): Promise<boolean> {
+  const db = await getDb();
+  const row = await db.getFirstAsync<{ value: string }>('SELECT value FROM app_meta WHERE key = ?', HIDE_AMOUNTS_KEY);
+  return row?.value === '1';
+}
+
+export async function saveHideAmounts(value: boolean): Promise<void> {
+  const db = await getDb();
+  await db.runAsync(
+    'INSERT INTO app_meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value',
+    HIDE_AMOUNTS_KEY,
+    value ? '1' : '0'
+  );
+}
+
+export async function getAppLockEnabled(): Promise<boolean> {
+  const db = await getDb();
+  const row = await db.getFirstAsync<{ value: string }>(
+    'SELECT value FROM app_meta WHERE key = ?',
+    APP_LOCK_ENABLED_KEY
+  );
+  return row?.value === '1';
+}
+
+export async function saveAppLockEnabled(value: boolean): Promise<void> {
+  const db = await getDb();
+  await db.runAsync(
+    'INSERT INTO app_meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value',
+    APP_LOCK_ENABLED_KEY,
+    value ? '1' : '0'
+  );
+}
+
+export async function getSavedAppPin(): Promise<string> {
+  const db = await getDb();
+  const row = await db.getFirstAsync<{ value: string }>('SELECT value FROM app_meta WHERE key = ?', APP_PIN_KEY);
+  return row?.value ?? '';
+}
+
+export async function saveAppPin(pin: string): Promise<void> {
+  const db = await getDb();
+  await db.runAsync(
+    'INSERT INTO app_meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value',
+    APP_PIN_KEY,
+    pin
   );
 }
