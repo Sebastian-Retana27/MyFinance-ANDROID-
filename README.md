@@ -1,40 +1,47 @@
-# MyFinance (Expo + SQLite Offline)
+# MyFinance
 
-Base inicial para app movil 100% offline con React Native (Expo) y SQLite local.
+MyFinance is a mobile personal finance app built with React Native (Expo) and SQLite.
 
-## Requisitos
+## App Features
 
-- Node.js 20+
-- Expo Go instalado en tu telefono
-- PC y telefono en la misma red
-
-## Ejecutar en tiempo real (Expo Go)
-
-```bash
-npx expo start --offline
-```
-
-Si `8081` esta ocupado, acepta el cambio al puerto sugerido (por ejemplo `8082`).
-
-## Funciones implementadas
-
-- SQLite local funcionando (`expo-sqlite`)
-- Alta y listado de gastos local
-- Carga de captura de factura desde galeria (`expo-image-picker`)
-- Analizador de texto de factura que calcula por producto:
-  - Nombre
-  - Unidades compradas
-  - Precio unitario
-  - Total por linea
-- Resumen total de la factura:
-  - Total de dinero
-  - Total de unidades
-
-## Nota tecnica sobre OCR local + Expo Go
-
-Expo Go no incluye modulos OCR nativos de terceros. En esta version:
-
-- Se puede cargar la captura de factura.
-- Se puede pegar/corregir el texto OCR y analizarlo 100% offline.
-
-Para OCR local automatico real en el dispositivo, el siguiente paso es usar Expo Dev Client + modulo OCR nativo.
+- Manual expense tracking with:
+  - Product name
+  - Quantity
+  - Amount
+  - Category
+  - Account used
+- Receipt upload and OCR text analysis to extract:
+  - Item names (when available)
+  - Item amounts
+  - Receipt total
+- Fallback receipt support:
+  - If item detail is missing, saves total as `Receipt without name`
+- Transfer workflows:
+  - `Received transfer` (adds to selected account)
+  - `Sent transfer` (subtracts from selected account)
+- Account management:
+  - Create custom accounts
+  - Set custom account color
+  - Add or subtract balance
+  - Delete accounts
+- Budget by category:
+  - Set budget limit per category
+  - Increase/decrease budget
+  - Remaining budget auto-calculation based on expenses
+  - Threshold alerts (50%, 25%, 10%, 0%, overspent)
+- Home dashboard:
+  - Monthly spending structure (pie chart)
+  - Monthly total insights (including category highlights)
+  - Product history grouped by month/year
+- Transactions view:
+  - Month/year filters
+  - Product search with predictions from stored history
+  - Delete entries from table and database
+- Settings:
+  - Language switch (Spanish/English)
+  - Theme switch (dark/light)
+  - Number/thousand separator format options
+  - Contact button for bug reports by email
+- Data persistence:
+  - Local SQLite storage
+  - Existing user data preserved across app updates (same package + signing key)
