@@ -1,7 +1,7 @@
-export const DEFAULT_PRODUCT_CATEGORIES = ['varios', 'celular', 'comida', 'hogar', 'transporte'] as const;
+export const DEFAULT_PRODUCT_CATEGORIES: string[] = [];
 export const FALLBACK_CATEGORY = 'varios';
 
-type CategoryName = (typeof DEFAULT_PRODUCT_CATEGORIES)[number];
+type CategoryName = 'varios' | 'celular' | 'comida' | 'hogar' | 'transporte';
 
 type CategoryRule = {
   category: CategoryName;

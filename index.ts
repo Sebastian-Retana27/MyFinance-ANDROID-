@@ -1,6 +1,11 @@
 import { registerRootComponent } from 'expo';
+import * as SplashScreen from 'expo-splash-screen';
 
 import App from './App';
+
+void SplashScreen.preventAutoHideAsync().catch(() => {
+  // Expo Go or web may already control the native splash lifecycle.
+});
 
 // registerRootComponent calls AppRegistry.registerComponent('main', () => App);
 // It also ensures that whether you load the app in Expo Go or in a native build,

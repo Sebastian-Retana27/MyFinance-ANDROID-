@@ -1,15 +1,18 @@
 import { getDb } from '../db/database';
+import { DEFAULT_CURRENCY_CODE, isSupportedCurrencyCode, type AppCurrencyCode } from '../constants/currencies';
 
-export type AppLanguage = 'es' | 'en';
+export type AppLanguage = 'es' | 'en' | 'it' | 'ja';
 export type AppThemeMode = 'dark' | 'light' | 'original';
 export type AppNumberFormat = 'none' | 'comma' | 'dot_comma' | 'space_dot' | 'space_comma';
 
 const LANGUAGE_KEY = 'app_language';
 const THEME_MODE_KEY = 'app_theme_mode';
 const NUMBER_FORMAT_KEY = 'app_number_format';
+const DEFAULT_CURRENCY_KEY = 'default_currency_code';
 const HIDE_AMOUNTS_KEY = 'hide_amounts';
 const APP_PIN_KEY = 'app_pin';
 const APP_LOCK_ENABLED_KEY = 'app_lock_enabled';
+const ONBOARDING_COMPLETED_KEY = 'onboarding_completed';
 
 export async function getSavedLanguage(): Promise<AppLanguage> {
   const db = await getDb();
@@ -18,7 +21,10 @@ export async function getSavedLanguage(): Promise<AppLanguage> {
     return 'es';
   }
 
-  return row.value === 'en' ? 'en' : 'es';
+  if (row.value === 'en' || row.value === 'it' || row.value === 'ja') {
+    return row.value;
+  }
+  return 'es';
 }
 
 export async function saveLanguage(language: AppLanguage): Promise<void> {
@@ -34,7 +40,7 @@ export async function getSavedThemeMode(): Promise<AppThemeMode> {
   const db = await getDb();
   const row = await db.getFirstAsync<{ value: string }>('SELECT value FROM app_meta WHERE key = ?', THEME_MODE_KEY);
   if (!row?.value) {
-    return 'dark';
+    return 'original';
   }
 
   if (row.value === 'light') {
@@ -43,7 +49,7 @@ export async function getSavedThemeMode(): Promise<AppThemeMode> {
   if (row.value === 'original') {
     return 'original';
   }
-  return 'dark';
+  return 'original';
 }
 
 export async function saveThemeMode(mode: AppThemeMode): Promise<void> {
@@ -129,5 +135,38 @@ export async function saveAppPin(pin: string): Promise<void> {
     'INSERT INTO app_meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value',
     APP_PIN_KEY,
     pin
+  );
+}
+
+export async function getDefaultCurrencyCode(): Promise<AppCurrencyCode> {
+  const db = await getDb();
+  const row = await db.getFirstAsync<{ value: string }>('SELECT value FROM app_meta WHERE key = ?', DEFAULT_CURRENCY_KEY);
+  return row?.value && isSupportedCurrencyCode(row.value) ? row.value : DEFAULT_CURRENCY_CODE;
+}
+
+export async function saveDefaultCurrencyCode(currencyCode: AppCurrencyCode): Promise<void> {
+  const db = await getDb();
+  await db.runAsync(
+    'INSERT INTO app_meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value',
+    DEFAULT_CURRENCY_KEY,
+    currencyCode
+  );
+}
+
+export async function getOnboardingCompleted(): Promise<boolean> {
+  const db = await getDb();
+  const row = await db.getFirstAsync<{ value: string }>(
+    'SELECT value FROM app_meta WHERE key = ?',
+    ONBOARDING_COMPLETED_KEY
+  );
+  return row?.value === '1';
+}
+
+export async function saveOnboardingCompleted(value: boolean): Promise<void> {
+  const db = await getDb();
+  await db.runAsync(
+    'INSERT INTO app_meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value',
+    ONBOARDING_COMPLETED_KEY,
+    value ? '1' : '0'
   );
 }

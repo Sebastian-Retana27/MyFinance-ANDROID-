@@ -19,3 +19,46 @@ export type MonthlyTransactionSummary = {
   totalIncome: number;
   net: number;
 };
+
+export type TransactionSortField = 'date' | 'amount';
+export type SortDirection = 'desc' | 'asc';
+
+export type TransactionQueryFilters = {
+  fromDate?: string;
+  toDate?: string;
+  type?: TransactionType;
+  accountName?: string;
+  category?: string;
+  search?: string;
+  sortField?: TransactionSortField;
+  sortDirection?: SortDirection;
+  limit?: number;
+};
+
+export type TransactionCursor = {
+  id: number;
+  createdAt: string;
+  amount: number;
+};
+
+export type TransactionPageResult = {
+  items: Transaction[];
+  nextCursor: TransactionCursor | null;
+  hasMore: boolean;
+};
+
+export type MonthlyFinancialSummary = {
+  income: number;
+  expense: number;
+  balance: number;
+};
+
+export type CategoryTotal = {
+  category: string;
+  total: number;
+};
+
+export type AccountMovementTotal = {
+  accountName: string;
+  totalMovement: number;
+};

@@ -4,17 +4,18 @@ import type { IncomeEntry, IncomeEntrySource } from '../models/incomeEntry';
 export async function createIncomeEntry(
   source: IncomeEntrySource,
   amount: number,
-  accountName: string
+  accountName: string,
+  createdAt?: string
 ): Promise<void> {
   const db = await getDb();
-  const createdAt = new Date().toISOString();
+  const createdAtValue = createdAt ?? new Date().toISOString();
 
   await db.runAsync(
     'INSERT INTO income_entries (source, amount, account_name, created_at) VALUES (?, ?, ?, ?)',
     source,
     amount,
     accountName,
-    createdAt
+    createdAtValue
   );
 }
 

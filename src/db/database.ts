@@ -1,7 +1,7 @@
 import { SQLiteDatabase, openDatabaseAsync } from 'expo-sqlite';
 
 const DB_NAME = 'myfinance.db';
-const SCHEMA_VERSION = 8;
+const SCHEMA_VERSION = 12;
 let dbInstance: SQLiteDatabase | null = null;
 
 async function hasColumn(db: SQLiteDatabase, tableName: string, columnName: string): Promise<boolean> {
@@ -39,7 +39,9 @@ async function bootstrapTables(db: SQLiteDatabase): Promise<void> {
       quantity INTEGER NOT NULL DEFAULT 1,
       amount REAL NOT NULL,
       account_name TEXT NOT NULL DEFAULT '',
-      created_at TEXT NOT NULL
+      created_at TEXT NOT NULL,
+      is_deleted INTEGER NOT NULL DEFAULT 0,
+      deleted_at TEXT NOT NULL DEFAULT ''
     );
 
     CREATE TABLE IF NOT EXISTS products (
@@ -50,7 +52,9 @@ async function bootstrapTables(db: SQLiteDatabase): Promise<void> {
       unit_price REAL NOT NULL,
       line_total REAL NOT NULL,
       account_name TEXT NOT NULL DEFAULT '',
-      created_at TEXT NOT NULL
+      created_at TEXT NOT NULL,
+      is_deleted INTEGER NOT NULL DEFAULT 0,
+      deleted_at TEXT NOT NULL DEFAULT ''
     );
 
     CREATE TABLE IF NOT EXISTS categories (
@@ -62,6 +66,7 @@ async function bootstrapTables(db: SQLiteDatabase): Promise<void> {
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       name TEXT NOT NULL,
       balance REAL NOT NULL DEFAULT 0,
+      currency_code TEXT NOT NULL DEFAULT 'CRC',
       color TEXT NOT NULL,
       created_at TEXT NOT NULL
     );
@@ -107,14 +112,39 @@ async function bootstrapTables(db: SQLiteDatabase): Promise<void> {
       created_at TEXT NOT NULL
     );
 
+    CREATE TABLE IF NOT EXISTS payables (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT NOT NULL,
+      amount REAL NOT NULL,
+      category TEXT NOT NULL DEFAULT 'varios',
+      due_day INTEGER NOT NULL DEFAULT 1,
+      is_paid INTEGER NOT NULL DEFAULT 0,
+      paid_at TEXT NOT NULL DEFAULT '',
+      paid_account_name TEXT NOT NULL DEFAULT '',
+      created_at TEXT NOT NULL
+    );
+
     CREATE INDEX IF NOT EXISTS idx_transactions_created_at ON transactions(created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_transactions_account_name ON transactions(account_name);
     CREATE INDEX IF NOT EXISTS idx_transactions_category ON transactions(category);
     CREATE INDEX IF NOT EXISTS idx_transactions_type ON transactions(type);
+    CREATE INDEX IF NOT EXISTS idx_transactions_type_created_at ON transactions(type, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_transactions_category_created_at ON transactions(category, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_transactions_account_created_at ON transactions(account_name, created_at DESC);
+
+    CREATE INDEX IF NOT EXISTS idx_products_created_at ON products(created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_products_category_created_at ON products(category, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_products_account_created_at ON products(account_name, created_at DESC);
+
+    CREATE INDEX IF NOT EXISTS idx_expenses_created_at ON expenses(created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_expenses_account_created_at ON expenses(account_name, created_at DESC);
 
     CREATE INDEX IF NOT EXISTS idx_account_movements_created_at ON account_movements(created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_account_movements_account_name ON account_movements(account_name);
     CREATE INDEX IF NOT EXISTS idx_account_movements_type ON account_movements(type);
+
+    CREATE INDEX IF NOT EXISTS idx_payables_is_paid_due_day ON payables(is_paid, due_day);
+    CREATE INDEX IF NOT EXISTS idx_payables_category ON payables(category);
   `);
 }
 
@@ -135,17 +165,8 @@ async function migrateToV2(db: SQLiteDatabase): Promise<void> {
 
 async function migrateToV3(db: SQLiteDatabase): Promise<void> {
   await db.runAsync(
-    "INSERT OR IGNORE INTO categories (name) VALUES ('varios'), ('celular'), ('comida'), ('hogar'), ('transporte')"
+    "INSERT INTO app_meta (key, value) VALUES ('default_categories_disabled', '1') ON CONFLICT(key) DO UPDATE SET value = '1'"
   );
-
-  await db.runAsync(`
-    INSERT OR IGNORE INTO category_colors (category, color) VALUES
-    ('varios', '#94a3b8'),
-    ('celular', '#38bdf8'),
-    ('comida', '#34d399'),
-    ('hogar', '#f59e0b'),
-    ('transporte', '#f97316')
-  `);
 }
 
 async function migrateToV4(db: SQLiteDatabase): Promise<void> {
@@ -339,6 +360,53 @@ async function migrateToV8(db: SQLiteDatabase): Promise<void> {
   `);
 }
 
+async function migrateToV9(db: SQLiteDatabase): Promise<void> {
+  // Add missing indexes for product/expense history queries.
+  await db.execAsync(`
+    CREATE INDEX IF NOT EXISTS idx_products_created_at ON products(created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_products_is_deleted_created_at ON products(is_deleted, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_products_category_created_at ON products(category, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_products_account_created_at ON products(account_name, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_expenses_created_at ON expenses(created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_expenses_is_deleted_created_at ON expenses(is_deleted, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_expenses_account_created_at ON expenses(account_name, created_at DESC);
+  `);
+}
+
+async function migrateToV10(db: SQLiteDatabase): Promise<void> {
+  // Composite indexes for filtered/paginated transaction queries and monthly aggregates.
+  await db.execAsync(`
+    CREATE INDEX IF NOT EXISTS idx_transactions_type_created_at ON transactions(type, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_transactions_category_created_at ON transactions(category, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_transactions_account_created_at ON transactions(account_name, created_at DESC);
+  `);
+}
+
+async function migrateToV11(db: SQLiteDatabase): Promise<void> {
+  if (!(await hasColumn(db, 'accounts', 'currency_code'))) {
+    await db.runAsync("ALTER TABLE accounts ADD COLUMN currency_code TEXT NOT NULL DEFAULT 'CRC'");
+  }
+}
+
+async function migrateToV12(db: SQLiteDatabase): Promise<void> {
+  await db.execAsync(`
+    CREATE TABLE IF NOT EXISTS payables (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT NOT NULL,
+      amount REAL NOT NULL,
+      category TEXT NOT NULL DEFAULT 'varios',
+      due_day INTEGER NOT NULL DEFAULT 1,
+      is_paid INTEGER NOT NULL DEFAULT 0,
+      paid_at TEXT NOT NULL DEFAULT '',
+      paid_account_name TEXT NOT NULL DEFAULT '',
+      created_at TEXT NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_payables_is_paid_due_day ON payables(is_paid, due_day);
+    CREATE INDEX IF NOT EXISTS idx_payables_category ON payables(category);
+  `);
+}
+
 type Migration = {
   version: number;
   run: (db: SQLiteDatabase) => Promise<void>;
@@ -352,6 +420,10 @@ const MIGRATIONS: Migration[] = [
   { version: 6, run: migrateToV6 },
   { version: 7, run: migrateToV7 },
   { version: 8, run: migrateToV8 },
+  { version: 9, run: migrateToV9 },
+  { version: 10, run: migrateToV10 },
+  { version: 11, run: migrateToV11 },
+  { version: 12, run: migrateToV12 },
 ];
 
 export async function getDb(): Promise<SQLiteDatabase> {

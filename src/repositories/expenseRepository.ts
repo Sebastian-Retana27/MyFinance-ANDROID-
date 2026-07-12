@@ -5,10 +5,11 @@ export async function createExpense(
   description: string,
   quantity: number,
   amount: number,
-  accountName: string
+  accountName: string,
+  createdAt?: string
 ): Promise<void> {
   const db = await getDb();
-  const createdAt = new Date().toISOString();
+  const createdAtValue = createdAt ?? new Date().toISOString();
 
   await db.runAsync(
     'INSERT INTO expenses (description, quantity, amount, account_name, created_at) VALUES (?, ?, ?, ?, ?)',
@@ -16,7 +17,7 @@ export async function createExpense(
     quantity,
     amount,
     accountName,
-    createdAt
+    createdAtValue
   );
 }
 

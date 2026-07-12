@@ -39,6 +39,7 @@ export function HorizontalTabs<T extends string>({
           const active = item.key === activeKey;
           return (
             <TouchableOpacity
+              activeOpacity={0.78}
               key={item.key}
               onPress={() => onChange(item.key)}
               style={[
