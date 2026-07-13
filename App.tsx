@@ -1,6 +1,7 @@
 ﻿import { StatusBar } from 'expo-status-bar';
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactElement } from 'react';
 import * as SplashScreen from 'expo-splash-screen';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import * as ImagePicker from 'expo-image-picker';
 import {
   Alert,
@@ -841,7 +842,7 @@ const TEXTS = {
     createAccountFirst: 'Primero crea una cuenta en la seccion Cuentas.',
     bugNotice: '',
     ocrInProgress: '',
-    buildNumber: 'Build Numero 10',
+    buildNumber: 'Build 10 Estable',
     language: 'Idioma',
     theme: 'Tema',
     numberFormat: 'Formato numerico',
@@ -939,7 +940,7 @@ const TEXTS = {
     createAccountFirst: 'Create an account first in Accounts section.',
     bugNotice: '',
     ocrInProgress: '',
-    buildNumber: 'Build number 10',
+    buildNumber: 'Build 10 Stable',
     language: 'Language',
     theme: 'Theme',
     numberFormat: 'Number format',
@@ -1037,7 +1038,7 @@ const TEXTS = {
     createAccountFirst: 'Crea prima un conto nella sezione Conti.',
     bugNotice: '',
     ocrInProgress: '',
-    buildNumber: 'Build numero 10',
+    buildNumber: 'Build 10 Stabile',
     language: 'Lingua',
     theme: 'Tema',
     numberFormat: 'Formato numerico',
@@ -1135,7 +1136,7 @@ const TEXTS = {
     createAccountFirst: '先に「口座」セクションで口座を作成してください。',
     bugNotice: '',
     ocrInProgress: '',
-    buildNumber: 'ビルド番号 10',
+    buildNumber: 'ビルド 10 安定版',
     language: '言語',
     theme: 'テーマ',
     numberFormat: '数値形式',
@@ -1238,6 +1239,7 @@ function normalizeText(value: string): string {
 }
 
 export default function App() {
+  const insets = useSafeAreaInsets();
   const [language, setLanguage] = useState<AppLanguage>('es');
   const [themeMode, setThemeMode] = useState<AppThemeMode>('original');
   const [numberFormat, setNumberFormat] = useState<AppNumberFormat>('comma');
@@ -4620,7 +4622,7 @@ export default function App() {
     return (
       <SafeAreaView style={styles.safeArea}>
         <StatusBar style={statusBarStyle} />
-        <View style={styles.onboardingScreen}>
+        <View style={[styles.onboardingScreen, { paddingBottom: uiSpacing.md + insets.bottom }]}>
           <View style={styles.onboardingHeader}>
             <Text style={styles.onboardingBrand}>MyFinance</Text>
             <Text style={styles.onboardingBuild}>{t.buildNumber}</Text>
@@ -4688,7 +4690,7 @@ export default function App() {
       <StatusBar style={statusBarStyle} />
       <Animated.View style={[styles.mainContent, { opacity: Animated.multiply(themeOpacity, contentLoadOpacity) }]}>
         <View style={styles.sectionAnimatedWrap}>
-          <ScrollView contentContainerStyle={styles.container}>
+          <ScrollView contentContainerStyle={[styles.container, { paddingBottom: uiSpacing.md + insets.bottom }]}>
           <View style={styles.headerRow}>
             <TouchableOpacity activeOpacity={BUTTON_ACTIVE_OPACITY} style={styles.menuButton} onPress={openDrawer}>
               <Text style={styles.menuIcon}>{'\u2630'}</Text>
@@ -5536,6 +5538,7 @@ export default function App() {
                   <Text style={styles.secondaryButtonText}>{t.contact}</Text>
                 </TouchableOpacity>
                 <Text style={styles.helpText}>{t.buildNumber}</Text>
+                <Text style={styles.helpText}>Developed by CodeZero Interactive</Text>
                 <Text style={styles.helpText}>
                   {translate(language, 'MyFinance guarda tus datos localmente en este dispositivo.', 'MyFinance stores your data locally on this device.', 'MyFinance conserva i dati localmente su questo dispositivo.', 'MyFinance\u306f\u3053\u306e\u7aef\u672b\u306b\u30c7\u30fc\u30bf\u3092\u30ed\u30fc\u30ab\u30eb\u4fdd\u5b58\u3057\u307e\u3059\u3002')}
                 </Text>
@@ -5645,11 +5648,11 @@ export default function App() {
         ) : null}
 
         {activeSection === 'inicio' ? (
-        <View pointerEvents="box-none" style={styles.quickFabLayer}>
+        <View pointerEvents="box-none" style={[styles.quickFabLayer, { paddingBottom: uiSpacing.lg + insets.bottom }]}>
           {isQuickMenuOpen ? (
             <>
               <View style={styles.quickMenuBackdrop} />
-              <View pointerEvents="none" style={styles.quickRadialMenu}>
+              <View pointerEvents="none" style={[styles.quickRadialMenu, { bottom: 94 + insets.bottom }]}>
                 <Animated.View
                   style={[
                     styles.quickRadialButton,
