@@ -4342,10 +4342,10 @@ export default function App() {
   const chartRadius = (chartSize - chartStroke) / 2;
   const chartCircumference = 2 * Math.PI * chartRadius;
   const darkModeChartTrack = '#6b7280';
-  const darkModeChartSlice = '#d1d5db';
   const chartTrackColor = themeMode === 'dark' ? darkModeChartTrack : theme.borderStrong;
+  // Category colors are user data, not theme colors. Keep them visible in every theme.
   const getChartSliceColor = (category: string) =>
-    themeMode === 'dark' ? darkModeChartSlice : (categoryColorMap[category] ?? '#94a3b8');
+    categoryColorMap[category] ?? DEFAULT_CATEGORY_COLORS[FALLBACK_CATEGORY];
   const statusBarStyle = themeMode === 'light' ? 'dark' : 'light';
   const canSaveManualExpense = useMemo(() => {
     const parsedQuantity = Number(quantity);
