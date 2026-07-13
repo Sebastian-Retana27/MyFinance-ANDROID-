@@ -1,4 +1,5 @@
 import { getDb } from '../db/database';
+import * as Crypto from 'expo-crypto';
 
 type BackupFormat = 'myfinance-backup-v1' | 'myfinance-backup-v2';
 
@@ -23,6 +24,7 @@ export type BackupPayload = {
     recordCounts: Record<string, number>;
     totalRecords: number;
     checksum: string;
+    checksumAlgorithm?: 'sha256' | 'fnv1a';
   };
 };
 
@@ -51,6 +53,15 @@ const TABLES = [
 ] as const;
 
 const BACKUP_CHUNK_SIZE = 500;
+const SENSITIVE_APP_META_KEYS = new Set(['app_pin', 'app_lock_enabled']);
+
+function isSensitiveAppMetaRow(value: unknown): boolean {
+  if (!value || typeof value !== 'object') {
+    return false;
+  }
+  const key = (value as Record<string, unknown>).key;
+  return typeof key === 'string' && SENSITIVE_APP_META_KEYS.has(key);
+}
 
 function asString(value: unknown, fallback = ''): string {
   return typeof value === 'string' ? value : fallback;
@@ -78,15 +89,26 @@ function fnv1aHash(input: string): string {
   return (hash >>> 0).toString(16);
 }
 
-function buildBackupChecksum(data: BackupPayload['data']): string {
+function buildChecksumSource(data: BackupPayload['data']): string {
   const source = TABLES.map((item) => {
     const rows = (data[item.key] ?? []) as unknown[];
     return `${item.key}:${rows.length}:${JSON.stringify(rows)}`;
   }).join('|');
-  return fnv1aHash(source);
+  return source;
+}
+
+async function buildBackupChecksum(data: BackupPayload['data']): Promise<string> {
+  return Crypto.digestStringAsync(
+    Crypto.CryptoDigestAlgorithm.SHA256,
+    buildChecksumSource(data)
+  );
 }
 
 function buildLegacyBackupChecksum(data: BackupPayload['data']): string {
+  return fnv1aHash(buildChecksumSource(data));
+}
+
+function buildLegacyBackupChecksumWithoutPayables(data: BackupPayload['data']): string {
   const source = TABLES.filter((item) => item.key !== 'payables').map((item) => {
     const rows = (data[item.key] ?? []) as unknown[];
     return `${item.key}:${rows.length}:${JSON.stringify(rows)}`;
@@ -160,7 +182,7 @@ export function validateBackupPayload(value: unknown): value is BackupPayload {
   return requiredKeys.every((key) => isArrayRecord(data[key]));
 }
 
-export function validateBackupIntegrity(payload: BackupPayload): { valid: boolean; reason?: string } {
+export async function validateBackupIntegrity(payload: BackupPayload): Promise<{ valid: boolean; reason?: string }> {
   if (!validateBackupPayload(payload)) {
     return { valid: false, reason: 'Backup structure is invalid.' };
   }
@@ -170,10 +192,17 @@ export function validateBackupIntegrity(payload: BackupPayload): { valid: boolea
       return { valid: false, reason: 'Backup metadata is missing.' };
     }
 
-    const expectedChecksum = buildBackupChecksum(payload.data);
+    const expectedChecksum = await buildBackupChecksum(payload.data);
     if (expectedChecksum !== payload.metadata.checksum) {
+      if (payload.metadata.checksumAlgorithm === 'sha256') {
+        return { valid: false, reason: 'Backup checksum does not match content.' };
+      }
       const legacyChecksum = buildLegacyBackupChecksum(payload.data);
-      if (legacyChecksum !== payload.metadata.checksum) {
+      const legacyChecksumWithoutPayables = buildLegacyBackupChecksumWithoutPayables(payload.data);
+      if (
+        legacyChecksum !== payload.metadata.checksum &&
+        legacyChecksumWithoutPayables !== payload.metadata.checksum
+      ) {
         return { valid: false, reason: 'Backup checksum does not match content.' };
       }
     }
@@ -220,14 +249,17 @@ export async function createBackupPayload(
       tableIndex: i + 1,
     });
     const rows = await readTableInChunks(item.table, BACKUP_CHUNK_SIZE);
-    (data[item.key] as unknown[]) = rows;
-    recordCounts[item.key] = rows.length;
-    totalRecords += rows.length;
+    const exportRows = item.key === 'appMeta'
+      ? rows.filter((row) => !isSensitiveAppMetaRow(row))
+      : rows;
+    (data[item.key] as unknown[]) = exportRows;
+    recordCounts[item.key] = exportRows.length;
+    totalRecords += exportRows.length;
     onProgress?.({
       stage: 'reading',
       tableKey: item.key,
       tableLabel: item.table,
-      processed: rows.length,
+      processed: exportRows.length,
       total,
       totalTables: TABLES.length,
       tableIndex: i + 1,
@@ -235,7 +267,7 @@ export async function createBackupPayload(
     await yieldToUi();
   }
 
-  const checksum = buildBackupChecksum(data);
+  const checksum = await buildBackupChecksum(data);
   const payload: BackupPayload = {
     format: 'myfinance-backup-v2',
     createdAt: new Date().toISOString(),
@@ -245,6 +277,7 @@ export async function createBackupPayload(
       recordCounts,
       totalRecords,
       checksum,
+      checksumAlgorithm: 'sha256',
     },
   };
 
@@ -261,7 +294,7 @@ export async function createBackupPayload(
 }
 
 export async function restoreBackupPayload(payload: BackupPayload, mode: 'merge' | 'replace' = 'merge'): Promise<void> {
-  const integrity = validateBackupIntegrity(payload);
+  const integrity = await validateBackupIntegrity(payload);
   if (!integrity.valid) {
     throw new Error(integrity.reason ?? 'Invalid backup.');
   }
@@ -430,7 +463,7 @@ export async function restoreBackupPayload(payload: BackupPayload, mode: 'merge'
     }
 
     for (const meta of payload.data.appMeta as Array<Record<string, unknown>>) {
-      if (meta.key === 'schema_version') {
+      if (meta.key === 'schema_version' || isSensitiveAppMetaRow(meta)) {
         continue;
       }
       await tx.runAsync(

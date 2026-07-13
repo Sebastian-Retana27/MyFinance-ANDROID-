@@ -5,8 +5,8 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import * as ImagePicker from 'expo-image-picker';
 import {
   Alert,
+  AppState,
   Animated,
-  FlatList,
   Image,
   InteractionManager,
   Linking,
@@ -24,7 +24,7 @@ import {
   TouchableOpacity,
   View,
 } from 'react-native';
-import Svg, { Circle, G } from 'react-native-svg';
+import Svg, { Circle, G, Line, Path, Polyline, Rect } from 'react-native-svg';
 import { SkeletonBlock, SkeletonRows } from './src/components/Skeleton';
 import { initDb } from './src/db/database';
 import type { Account } from './src/models/account';
@@ -70,12 +70,17 @@ import {
   getSavedAppPin,
   getAppLockEnabled,
   getHideAmounts,
+  getSavedChartType,
+  clearPinFailedAttempts,
+  getPinLockoutRemainingMs,
+  registerFailedPinAttempt,
   getSavedNumberFormat,
   getSavedThemeMode,
   getOnboardingCompleted,
   getDefaultCurrencyCode,
   saveAppLockEnabled,
   saveAppPin,
+  saveChartType,
   saveDefaultCurrencyCode,
   saveHideAmounts,
   saveNumberFormat,
@@ -83,6 +88,7 @@ import {
   saveOnboardingCompleted,
   saveThemeMode,
   type AppLanguage,
+  type AppChartType,
   type AppNumberFormat,
   type AppThemeMode,
 } from './src/repositories/settingsRepository';
@@ -90,6 +96,7 @@ import {
   CURRENCY_OPTIONS,
   DEFAULT_CURRENCY_CODE,
   getCurrencyOption,
+  roundCurrencyAmount,
   type AppCurrencyCode,
 } from './src/constants/currencies';
 import {
@@ -1230,6 +1237,29 @@ function getNumberFormatLabel(value: AppNumberFormat, texts: (typeof TEXTS)[AppL
   return texts.numberFormatComma;
 }
 
+function getChartTypeLabel(value: AppChartType, language: AppLanguage): string {
+  if (value === 'circle') return translate(language, 'Círculo', 'Circle', 'Cerchio', '\u5186');
+  if (value === 'line') return translate(language, 'Líneas', 'Lines', 'Linee', '\u7dda');
+  if (value === 'bar') return translate(language, 'Barras', 'Bars', 'Barre', '\u68d2');
+  return translate(language, 'Pastel', 'Pie', 'Torta', '\u5186\u30b0\u30e9\u30d5');
+}
+
+function describePieSlice(
+  center: number,
+  radius: number,
+  startRatio: number,
+  endRatio: number
+): string {
+  const startAngle = startRatio * Math.PI * 2 - Math.PI / 2;
+  const endAngle = endRatio * Math.PI * 2 - Math.PI / 2;
+  const startX = center + radius * Math.cos(startAngle);
+  const startY = center + radius * Math.sin(startAngle);
+  const endX = center + radius * Math.cos(endAngle);
+  const endY = center + radius * Math.sin(endAngle);
+  const largeArc = endRatio - startRatio > 0.5 ? 1 : 0;
+  return `M ${center} ${center} L ${startX} ${startY} A ${radius} ${radius} 0 ${largeArc} 1 ${endX} ${endY} Z`;
+}
+
 function normalizeText(value: string): string {
   return value
     .normalize('NFD')
@@ -1243,6 +1273,7 @@ export default function App() {
   const [language, setLanguage] = useState<AppLanguage>('es');
   const [themeMode, setThemeMode] = useState<AppThemeMode>('original');
   const [numberFormat, setNumberFormat] = useState<AppNumberFormat>('comma');
+  const [chartType, setChartType] = useState<AppChartType>('pie');
   const [defaultCurrencyCode, setDefaultCurrencyCode] = useState<AppCurrencyCode>(DEFAULT_CURRENCY_CODE);
   const [hideAmounts, setHideAmounts] = useState(false);
   const [appLockEnabled, setAppLockEnabled] = useState(false);
@@ -1796,6 +1827,11 @@ export default function App() {
     setNumberFormat(saved);
   }, []);
 
+  const loadChartType = useCallback(async () => {
+    const saved = await getSavedChartType();
+    setChartType(saved);
+  }, []);
+
   const loadDefaultCurrency = useCallback(async () => {
     const saved = await getDefaultCurrencyCode();
     setDefaultCurrencyCode(saved);
@@ -1862,6 +1898,7 @@ export default function App() {
           loadLanguage(),
           loadThemeMode(),
           loadNumberFormat(),
+          loadChartType(),
           loadDefaultCurrency(),
           loadPrivacySettings(),
           loadOnboardingState(),
@@ -1872,7 +1909,7 @@ export default function App() {
         setLoading(false);
       }
     })();
-  }, [loadDefaultCurrency, loadLanguage, loadNumberFormat, loadOnboardingState, loadPrivacySettings, loadThemeMode, reloadAllData]);
+  }, [loadChartType, loadDefaultCurrency, loadLanguage, loadNumberFormat, loadOnboardingState, loadPrivacySettings, loadThemeMode, reloadAllData]);
 
   useEffect(() => {
     if (loading) {
@@ -1890,6 +1927,17 @@ export default function App() {
       useNativeDriver: true,
     }).start();
   }, [contentLoadOpacity, loading]);
+
+  useEffect(() => {
+    const subscription = AppState.addEventListener('change', (nextState) => {
+      if (nextState !== 'active' && appLockEnabled) {
+        setIsUnlocked(false);
+        setPinInput('');
+      }
+    });
+
+    return () => subscription.remove();
+  }, [appLockEnabled]);
 
   useEffect(() => {
     if (categories.length > 0 && !categories.includes(manualCategory)) {
@@ -1948,8 +1996,8 @@ export default function App() {
       return;
     }
 
-    if (!accounts.some((account) => account.id === selectedExpenseAccountId)) {
-      setSelectedExpenseAccountId(accounts[0].id);
+    if (selectedExpenseAccountId !== null && !accounts.some((account) => account.id === selectedExpenseAccountId)) {
+      setSelectedExpenseAccountId(null);
     }
   }, [
     accounts,
@@ -2120,7 +2168,7 @@ export default function App() {
         manualCategory,
         selectedAccount.name
       );
-      await updateAccountBalance(selectedAccount.id, Number((selectedAccount.balance - manualLineTotal).toFixed(2)));
+      await updateAccountBalance(selectedAccount.id, roundCurrencyAmount(selectedAccount.balance - manualLineTotal, selectedAccount.currencyCode));
       await createAccountMovement({
         type: 'expense_manual',
         amount: -manualLineTotal,
@@ -2558,7 +2606,7 @@ export default function App() {
       });
       await updateAccountBalance(
         selectedAccount.id,
-        Number((selectedAccount.balance - receiptTotal).toFixed(2))
+        roundCurrencyAmount(selectedAccount.balance - receiptTotal, selectedAccount.currencyCode)
       );
       await createAccountMovement({
         type: 'expense_receipt',
@@ -2750,8 +2798,8 @@ export default function App() {
 
     const nextBalance =
       transferMode === 'received'
-        ? Number((selectedAccount.balance + totalToApply).toFixed(2))
-        : Number((selectedAccount.balance - totalToApply).toFixed(2));
+        ? roundCurrencyAmount(selectedAccount.balance + totalToApply, selectedAccount.currencyCode)
+        : roundCurrencyAmount(selectedAccount.balance - totalToApply, selectedAccount.currencyCode);
 
     try {
       await updateAccountBalance(selectedAccount.id, nextBalance);
@@ -3267,7 +3315,7 @@ export default function App() {
     try {
       await createExpense(note, 1, parsedAmount, selectedAccount.name, createdAt);
       await createProduct(note, 1, parsedAmount, parsedAmount, createdAt, quickExpenseCategory, selectedAccount.name);
-      await updateAccountBalance(selectedAccount.id, Number((selectedAccount.balance - parsedAmount).toFixed(2)));
+      await updateAccountBalance(selectedAccount.id, roundCurrencyAmount(selectedAccount.balance - parsedAmount, selectedAccount.currencyCode));
       await createAccountMovement({
         type: 'expense_manual',
         amount: -parsedAmount,
@@ -3318,7 +3366,7 @@ export default function App() {
     try {
       const createdAt = new Date().toISOString();
       await createIncomeEntry('manual_add', parsedAmount, selectedAccount.name, createdAt);
-      await updateAccountBalance(selectedAccount.id, Number((selectedAccount.balance + parsedAmount).toFixed(2)));
+      await updateAccountBalance(selectedAccount.id, roundCurrencyAmount(selectedAccount.balance + parsedAmount, selectedAccount.currencyCode));
       await createAccountMovement({
         type: 'income_manual',
         amount: parsedAmount,
@@ -3398,6 +3446,22 @@ export default function App() {
       Alert.alert(
         translate(language, 'Error', 'Error', 'Errore', '\u30a8\u30e9\u30fc'),
         localizeLegacy(language, 'No se pudo guardar el formato numerico.', 'Could not save number format.')
+      );
+    }
+  };
+
+  const onChangeChartType = async (nextType: AppChartType) => {
+    if (nextType === chartType) {
+      return;
+    }
+
+    try {
+      setChartType(nextType);
+      await saveChartType(nextType);
+    } catch {
+      Alert.alert(
+        translate(language, 'Error', 'Error', 'Errore', '\u30a8\u30e9\u30fc'),
+        translate(language, 'No se pudo guardar el tipo de gráfica.', 'Could not save chart type.', 'Non è stato possibile salvare il tipo di grafico.', '\u30b0\u30e9\u30d5\u306e\u7a2e\u985e\u3092\u4fdd\u5b58\u3067\u304d\u307e\u305b\u3093\u3067\u3057\u305f\u3002')
       );
     }
   };
@@ -3484,14 +3548,35 @@ export default function App() {
     }
   };
 
-  const onUnlockApp = () => {
+  const onUnlockApp = async () => {
     if (!appLockEnabled) {
       setIsUnlocked(true);
       return;
     }
+
+    const remainingLockoutMs = await getPinLockoutRemainingMs();
+    if (remainingLockoutMs > 0) {
+      const seconds = Math.max(1, Math.ceil(remainingLockoutMs / 1000));
+      Alert.alert(
+        translate(language, 'Espera para intentarlo de nuevo', 'Wait before trying again', 'Attendi prima di riprovare', '\u518d\u5ea6\u8a66\u3059\u524d\u306b\u5f85\u3063\u3066\u304f\u3060\u3055\u3044'),
+        translate(language, `Por seguridad, espera ${seconds} segundos.`, `For security, wait ${seconds} seconds.`, `Per sicurezza, attendi ${seconds} secondi.`, `\u30bb\u30ad\u30e5\u30ea\u30c6\u30a3\u306e\u305f\u3081\u3001${seconds}\u79d2\u5f85\u3063\u3066\u304f\u3060\u3055\u3044\u3002`)
+      );
+      return;
+    }
+
     if (pinInput.trim() === appPin) {
       setIsUnlocked(true);
       setPinInput('');
+      await clearPinFailedAttempts();
+      return;
+    }
+
+    const lockoutMs = await registerFailedPinAttempt();
+    if (lockoutMs > 0) {
+      Alert.alert(
+        translate(language, 'Demasiados intentos', 'Too many attempts', 'Troppi tentativi', '\u8a66\u884c\u56de\u6570\u304c\u591a\u3059\u304e\u307e\u3059'),
+        translate(language, 'Por seguridad, espera 30 segundos antes de intentarlo de nuevo.', 'For security, wait 30 seconds before trying again.', 'Per sicurezza, attendi 30 secondi prima di riprovare.', '\u30bb\u30ad\u30e5\u30ea\u30c6\u30a3\u306e\u305f\u3081\u300130\u79d2\u5f85\u3063\u3066\u304b\u3089\u3082\u3046\u4e00\u5ea6\u8a66\u3057\u3066\u304f\u3060\u3055\u3044\u3002')
+      );
       return;
     }
     Alert.alert(localizeLegacy(language, 'PIN incorrecto', 'Wrong PIN'));
@@ -3589,7 +3674,16 @@ export default function App() {
       return;
     }
 
-    const integrity = validateBackupIntegrity(parsed as BackupPayload);
+    let integrity: { valid: boolean; reason?: string };
+    try {
+      integrity = await validateBackupIntegrity(parsed as BackupPayload);
+    } catch {
+      Alert.alert(
+        localizeLegacy(language, 'Backup inválido', 'Invalid backup'),
+        localizeLegacy(language, 'No se pudo verificar la integridad del backup.', 'The backup integrity could not be verified.')
+      );
+      return;
+    }
     if (!integrity.valid) {
       Alert.alert(
         localizeLegacy(language, 'Backup inválido', 'Invalid backup'),
@@ -3655,7 +3749,7 @@ export default function App() {
       if (parsedBalance !== 0) {
         await createAccountMovement({
           type: 'account_adjustment',
-          amount: Number(parsedBalance.toFixed(2)),
+          amount: roundCurrencyAmount(parsedBalance, selectedAccountCurrencyCode),
           accountName: normalizedName,
           note: 'Initial account balance',
         });
@@ -3799,7 +3893,7 @@ export default function App() {
       const createdAt = new Date().toISOString();
       await updateAccountBalance(
         selectedAccount.id,
-        Number((selectedAccount.balance - selectedPayableForPayment.amount).toFixed(2))
+        roundCurrencyAmount(selectedAccount.balance - selectedPayableForPayment.amount, selectedAccount.currencyCode)
       );
       await markPayablePaid(selectedPayableForPayment.id, selectedAccount.name, createdAt);
       await createExpense(
@@ -3887,7 +3981,7 @@ export default function App() {
       return;
     }
 
-    const updatedBalance = Number((account.balance + operator * movement).toFixed(2));
+    const updatedBalance = roundCurrencyAmount(account.balance + operator * movement, account.currencyCode);
     if (updatedBalance < 0) {
       Alert.alert(
         localizeLegacy(language, 'Fondos insuficientes', 'Insufficient funds'),
@@ -4110,7 +4204,7 @@ export default function App() {
     if (from.currencyCode !== to.currencyCode) {
       try {
         const quote = await getExchangeRate(from.currencyCode, to.currencyCode);
-        destinationAmount = convertWithRate(parsed, quote.rate);
+        destinationAmount = convertWithRate(parsed, quote.rate, to.currencyCode);
         conversionNote = ` | FX ${from.currencyCode}/${to.currencyCode} ${quote.rate} (${quote.date}${quote.fromCache ? ', cached' : ''})`;
       } catch (error) {
         Alert.alert(
@@ -4121,8 +4215,8 @@ export default function App() {
       }
     }
 
-    const fromNext = Number((from.balance - parsed).toFixed(2));
-    const toNext = Number((to.balance + destinationAmount).toFixed(2));
+    const fromNext = roundCurrencyAmount(from.balance - parsed, from.currencyCode);
+    const toNext = roundCurrencyAmount(to.balance + destinationAmount, to.currencyCode);
 
     try {
       await updateAccountBalance(from.id, fromNext);
@@ -4346,6 +4440,163 @@ export default function App() {
   // Category colors are user data, not theme colors. Keep them visible in every theme.
   const getChartSliceColor = (category: string) =>
     categoryColorMap[category] ?? DEFAULT_CATEGORY_COLORS[FALLBACK_CATEGORY];
+  const renderHomeChartVisual = (): ReactElement => {
+    if (currentMonthTotal <= 0 || monthlyCategorySlices.length === 0) {
+      return (
+        <View style={styles.chartWrap}>
+          <View style={[styles.emptyChart, { borderColor: chartTrackColor }]} />
+          <View style={styles.chartCenter}>
+            <Text style={styles.chartCenterValue}>{displayCurrency(0)}</Text>
+            <Text style={styles.chartCenterSub}>{localizeLegacy(language, 'Total', 'Total')}</Text>
+          </View>
+        </View>
+      );
+    }
+
+    if (chartType === 'circle') {
+      let offsetRatio = 0;
+      return (
+        <View style={styles.chartWrap}>
+          <Svg width={chartSize} height={chartSize}>
+            {monthlyCategorySlices.length === 1 ? (
+              <Circle
+                cx={chartSize / 2}
+                cy={chartSize / 2}
+                r={chartRadius + chartStroke / 2}
+                fill={getChartSliceColor(monthlyCategorySlices[0].category)}
+              />
+            ) : monthlyCategorySlices.map((slice) => {
+              const nextRatio = offsetRatio + slice.percentage / 100;
+              const path = describePieSlice(chartSize / 2, chartRadius + chartStroke / 2, offsetRatio, nextRatio);
+              offsetRatio = nextRatio;
+              return <Path key={`circle-${slice.category}`} d={path} fill={getChartSliceColor(slice.category)} />;
+            })}
+          </Svg>
+        </View>
+      );
+    }
+
+    if (chartType === 'line' || chartType === 'bar') {
+      const padding = 16;
+      const graphWidth = chartSize - padding * 2;
+      const graphHeight = chartSize - padding * 2;
+      const maxValue = Math.max(...monthlyCategorySlices.map((slice) => slice.total), 1);
+      const getPoint = (index: number, value: number) => {
+        const x = monthlyCategorySlices.length === 1
+          ? chartSize / 2
+          : padding + (graphWidth * index) / (monthlyCategorySlices.length - 1);
+        const y = padding + graphHeight - (value / maxValue) * graphHeight;
+        return { x, y };
+      };
+
+      return (
+        <View style={styles.chartWrap}>
+          <Svg width={chartSize} height={chartSize}>
+            <Line
+              x1={padding}
+              y1={padding + graphHeight}
+              x2={padding + graphWidth}
+              y2={padding + graphHeight}
+              stroke={chartTrackColor}
+              strokeWidth={1}
+            />
+            {chartType === 'line' ? (
+              <>
+                <Polyline
+                  points={monthlyCategorySlices.map((slice, index) => {
+                    const point = getPoint(index, slice.total);
+                    return `${point.x},${point.y}`;
+                  }).join(' ')}
+                  fill="none"
+                  stroke={theme.accentStrong}
+                  strokeWidth={3}
+                  strokeLinejoin="round"
+                  strokeLinecap="round"
+                />
+                {monthlyCategorySlices.map((slice, index) => {
+                  const point = getPoint(index, slice.total);
+                  return (
+                    <Circle
+                      key={`line-${slice.category}`}
+                      cx={point.x}
+                      cy={point.y}
+                      r={4}
+                      fill={getChartSliceColor(slice.category)}
+                      stroke={theme.surface}
+                      strokeWidth={2}
+                    />
+                  );
+                })}
+              </>
+            ) : (() => {
+              const gap = 5;
+              const barWidth = Math.max(3, (graphWidth - gap * (monthlyCategorySlices.length - 1)) / monthlyCategorySlices.length);
+              return monthlyCategorySlices.map((slice, index) => {
+                const height = (slice.total / maxValue) * graphHeight;
+                const x = padding + index * (barWidth + gap);
+                const y = padding + graphHeight - height;
+                return (
+                  <Rect
+                    key={`bar-${slice.category}`}
+                    x={x}
+                    y={y}
+                    width={barWidth}
+                    height={height}
+                    rx={Math.min(4, barWidth / 2)}
+                    fill={getChartSliceColor(slice.category)}
+                  />
+                );
+              });
+            })()}
+          </Svg>
+        </View>
+      );
+    }
+
+    return (
+      <View style={styles.chartWrap}>
+        <Svg width={chartSize} height={chartSize}>
+          <Circle
+            cx={chartSize / 2}
+            cy={chartSize / 2}
+            r={chartRadius}
+            stroke={chartTrackColor}
+            strokeWidth={chartStroke}
+            fill="none"
+          />
+          <G rotation="-90" origin={`${chartSize / 2}, ${chartSize / 2}`}>
+            {monthlyCategorySlices.reduce(
+              (acc, slice, index) => {
+                const dashLength = chartCircumference * (slice.percentage / 100);
+                const offset = -chartCircumference * acc.offsetRatio;
+                acc.elements.push(
+                  <Circle
+                    key={`pie-${slice.category}-${index}`}
+                    cx={chartSize / 2}
+                    cy={chartSize / 2}
+                    r={chartRadius}
+                    stroke={getChartSliceColor(slice.category)}
+                    strokeWidth={chartStroke}
+                    fill="none"
+                    strokeDasharray={`${dashLength} ${chartCircumference}`}
+                    strokeDashoffset={offset}
+                    strokeLinecap="butt"
+                  />
+                );
+                acc.offsetRatio += slice.percentage / 100;
+                return acc;
+              },
+              { elements: [] as ReactElement[], offsetRatio: 0 }
+            ).elements}
+          </G>
+        </Svg>
+        <View style={styles.chartCenter}>
+          <Text style={styles.chartCenterValue}>{displayCurrency(currentMonthTotal)}</Text>
+          <Text style={styles.chartCenterSub}>{localizeLegacy(language, 'Total', 'Total')}</Text>
+        </View>
+      </View>
+    );
+  };
   const statusBarStyle = themeMode === 'light' ? 'dark' : 'light';
   const canSaveManualExpense = useMemo(() => {
     const parsedQuantity = Number(quantity);
@@ -4398,9 +4649,8 @@ export default function App() {
     if (!Number.isFinite(parseAmountInput(internalTransferAmount)) || parseAmountInput(internalTransferAmount) <= 0) return translate(language, 'Ingresa un monto mayor que 0.', 'Enter an amount greater than 0.', 'Inserisci un importo maggiore di 0.', '0より大きい金額を入力してください。');
     return null;
   }, [internalTransferAmount, internalTransferFromId, internalTransferToId, language]);
-  const keyTransactionItem = useCallback((item: Transaction) => item.id.toString(), []);
   const renderTransactionItem = useCallback(
-    ({ item }: { item: Transaction }): ReactElement => {
+    (item: Transaction): ReactElement => {
       const signedAmount = getTransactionSignedAmount(item);
       return (
         <View style={styles.itemRow}>
@@ -4582,35 +4832,22 @@ export default function App() {
           {localizeLegacy(language, 'No hay movimientos para este filtro.', 'No movements found for this filter.')}
         </Text>
       ) : (
-        <FlatList
-          data={transactions}
-          keyExtractor={keyTransactionItem}
-          renderItem={renderTransactionItem}
-          initialNumToRender={16}
-          maxToRenderPerBatch={16}
-          windowSize={7}
-          removeClippedSubviews={Platform.OS === 'android'}
-          onEndReachedThreshold={0.45}
-          onEndReached={() => {
-            void loadMoreTransactions();
-          }}
-          nestedScrollEnabled
-          scrollEnabled
-          style={styles.transactionsList}
-          ListFooterComponent={
-            isTransactionsLoadingMore ? (
-              <Text style={styles.loading}>{localizeLegacy(language, 'Cargando más...', 'Loading more...')}</Text>
-            ) : transactionsHasMore ? (
-              <Text style={styles.helpText}>
-                {localizeLegacy(language, 'Desliza para cargar más movimientos.', 'Scroll to load more movements.')}
+        <View style={styles.transactionsList}>
+          {transactions.map((item) => (
+            <View key={`transaction-${item.id}`}>{renderTransactionItem(item)}</View>
+          ))}
+          {isTransactionsLoadingMore ? (
+            <Text style={styles.loading}>{localizeLegacy(language, 'Cargando más...', 'Loading more...')}</Text>
+          ) : transactionsHasMore ? (
+            <TouchableOpacity activeOpacity={BUTTON_ACTIVE_OPACITY} style={styles.secondaryButton} onPress={() => void loadMoreTransactions()}>
+              <Text style={styles.secondaryButtonText}>
+                {localizeLegacy(language, 'Cargar más movimientos', 'Load more movements')}
               </Text>
-            ) : (
-              <Text style={styles.helpText}>
-                {localizeLegacy(language, 'Fin de resultados.', 'End of results.')}
-              </Text>
-            )
-          }
-        />
+            </TouchableOpacity>
+          ) : (
+            <Text style={styles.helpText}>{localizeLegacy(language, 'Fin de resultados.', 'End of results.')}</Text>
+          )}
+        </View>
       )}
     </View>
   );
@@ -4721,23 +4958,18 @@ export default function App() {
                 <View style={styles.homeHeroRow}>
                   <View style={styles.homeHeroTextWrap}>
                     <Text style={styles.homeHeroLabel}>{t.totalAccounts}</Text>
-                    <Text style={styles.homeHeroValue}>{totalAccountsDisplay}</Text>
+                    <Text
+                      adjustsFontSizeToFit
+                      minimumFontScale={0.55}
+                      numberOfLines={1}
+                      style={styles.homeHeroValue}
+                    >
+                      {totalAccountsDisplay}
+                    </Text>
                     <Text style={styles.homeHeroSubLabel}>{capitalize(currentMonthLabel)}</Text>
                   </View>
 
                   <Image source={require('./assets/icon.png')} style={styles.homeHeroLogo} />
-
-                  <TouchableOpacity
-                    activeOpacity={BUTTON_ACTIVE_OPACITY}
-                    style={styles.homeHeroVisibilityButton}
-                    onPress={() => void onToggleHideAmounts()}
-                  >
-                    <Text style={styles.homeHeroVisibilityButtonText}>
-                      {hideAmounts
-                        ? localizeLegacy(language, 'Ver', 'Show')
-                        : localizeLegacy(language, 'Ocultar', 'Hide')}
-                    </Text>
-                  </TouchableOpacity>
                 </View>
               </View>
 
@@ -4784,51 +5016,7 @@ export default function App() {
                 <Text style={styles.sectionTitle}>{t.spendingStructure}</Text>
                 <Text style={styles.helpText}>{capitalize(currentMonthLabel)}</Text>
                 <View style={styles.chartContentRow}>
-                  <View style={styles.chartWrap}>
-                    {currentMonthTotal > 0 ? (
-                      <Svg width={chartSize} height={chartSize}>
-                        <Circle
-                          cx={chartSize / 2}
-                          cy={chartSize / 2}
-                          r={chartRadius}
-                          stroke={chartTrackColor}
-                          strokeWidth={chartStroke}
-                          fill="none"
-                        />
-                        <G rotation="-90" origin={`${chartSize / 2}, ${chartSize / 2}`}>
-                          {monthlyCategorySlices.reduce(
-                            (acc, slice, index) => {
-                              const dashLength = chartCircumference * (slice.percentage / 100);
-                              const offset = -chartCircumference * acc.offsetRatio;
-                              acc.elements.push(
-                                <Circle
-                                  key={`${slice.category}-${index}`}
-                                  cx={chartSize / 2}
-                                  cy={chartSize / 2}
-                                  r={chartRadius}
-                                  stroke={getChartSliceColor(slice.category)}
-                                  strokeWidth={chartStroke}
-                                  fill="none"
-                                  strokeDasharray={`${dashLength} ${chartCircumference}`}
-                                  strokeDashoffset={offset}
-                                  strokeLinecap="butt"
-                                />
-                              );
-                              acc.offsetRatio += slice.percentage / 100;
-                              return acc;
-                            },
-                            { elements: [] as ReactElement[], offsetRatio: 0 }
-                          ).elements}
-                        </G>
-                      </Svg>
-                    ) : (
-                      <View style={[styles.emptyChart, { borderColor: chartTrackColor }]}></View>
-                    )}
-                    <View style={styles.chartCenter}>
-                      <Text style={styles.chartCenterValue}>{displayCurrency(currentMonthTotal)}</Text>
-                      <Text style={styles.chartCenterSub}>{localizeLegacy(language, 'Total', 'Total')}</Text>
-                    </View>
-                  </View>
+                  {renderHomeChartVisual()}
                 </View>
                 {monthlyCategorySlices.length > 0 ? (
                   <View style={styles.chartSideCard}>
@@ -5305,6 +5493,24 @@ export default function App() {
                   </TouchableOpacity>
                 </View>
 
+                <Text style={styles.filterLabel}>
+                  {translate(language, 'Tipo de gráfica', 'Chart type', 'Tipo di grafico', '\u30b0\u30e9\u30d5\u306e\u7a2e\u985e')}
+                </Text>
+                <View style={styles.settingsOptionGrid}>
+                  {(['pie', 'circle', 'line', 'bar'] as AppChartType[]).map((option) => (
+                    <TouchableOpacity
+                      activeOpacity={BUTTON_ACTIVE_OPACITY}
+                      key={`chart-type-${option}`}
+                      style={[styles.filterChip, chartType === option ? styles.filterChipActive : undefined]}
+                      onPress={() => void onChangeChartType(option)}
+                    >
+                      <Text style={[styles.filterChipText, chartType === option ? styles.filterChipTextActive : undefined]}>
+                        {getChartTypeLabel(option, language)}
+                      </Text>
+                    </TouchableOpacity>
+                  ))}
+                </View>
+
                 <Text style={styles.filterLabel}>{t.language}</Text>
                 <TouchableOpacity
                   activeOpacity={BUTTON_ACTIVE_OPACITY}
@@ -5507,29 +5713,38 @@ export default function App() {
               <View style={styles.configSectionCard}>
                 <Text style={styles.configSectionTitle}>{getSectionLabel('data', language)}</Text>
                 <View style={styles.settingsActionGrid}>
-                  <TouchableOpacity activeOpacity={BUTTON_ACTIVE_OPACITY} style={styles.secondaryButtonCompact} onPress={() => void onExportTransactionsCsv()}>
-                    <Text style={styles.secondaryButtonText}>
+                  <TouchableOpacity activeOpacity={BUTTON_ACTIVE_OPACITY} style={[styles.secondaryButtonCompact, styles.dataActionButton]} onPress={() => void onExportTransactionsCsv()}>
+                    <Text style={[styles.secondaryButtonText, styles.dataActionButtonText]}>
                       {isExportingCsv
                         ? localizeLegacy(language, 'Cancelar CSV', 'Cancel CSV')
                         : localizeLegacy(language, 'Exportar CSV', 'Export CSV')}
                     </Text>
                   </TouchableOpacity>
-                  <TouchableOpacity activeOpacity={BUTTON_ACTIVE_OPACITY} style={styles.secondaryButtonCompact} onPress={() => void onExportBackup()}>
-                    <Text style={styles.secondaryButtonText}>
+                  <TouchableOpacity activeOpacity={BUTTON_ACTIVE_OPACITY} style={[styles.secondaryButtonCompact, styles.dataActionButton]} onPress={() => void onExportBackup()}>
+                    <Text style={[styles.secondaryButtonText, styles.dataActionButtonText]}>
                       {isExportingBackup
                         ? localizeLegacy(language, 'Cancelar backup', 'Cancel backup')
                         : localizeLegacy(language, 'Exportar backup', 'Export backup')}
                     </Text>
                   </TouchableOpacity>
                   <TouchableOpacity activeOpacity={BUTTON_ACTIVE_OPACITY}
-                    style={styles.secondaryButtonCompact}
+                    style={[styles.secondaryButtonCompact, styles.dataActionButton]}
                     onPress={() => setIsRestoreBackupModalVisible(true)}
                   >
-                    <Text style={styles.secondaryButtonText}>{localizeLegacy(language, 'Restaurar backup', 'Restore backup')}</Text>
+                    <Text style={[styles.secondaryButtonText, styles.dataActionButtonText]}>{localizeLegacy(language, 'Restaurar backup', 'Restore backup')}</Text>
                   </TouchableOpacity>
                 </View>
                 {csvExportProgressLabel ? <Text style={styles.helpText}>{csvExportProgressLabel}</Text> : null}
                 {backupExportProgressLabel ? <Text style={styles.helpText}>{backupExportProgressLabel}</Text> : null}
+                <Text style={styles.helpText}>
+                  {translate(
+                    language,
+                    'Mantén los backups en un lugar privado: incluyen tus datos financieros, pero nunca tu PIN.',
+                    'Keep backups private: they include your financial data, but never your PIN.',
+                    'Conserva i backup in un luogo privato: includono i tuoi dati finanziari, ma mai il tuo PIN.',
+                    'バックアップには金融データが含まれますが、PINは含まれません。安全な場所に保管してください。'
+                  )}
+                </Text>
               </View>
 
               <View style={styles.configSectionCard}>
@@ -5538,7 +5753,22 @@ export default function App() {
                   <Text style={styles.secondaryButtonText}>{t.contact}</Text>
                 </TouchableOpacity>
                 <Text style={styles.helpText}>{t.buildNumber}</Text>
-                <Text style={styles.helpText}>Developed by CodeZero Interactive</Text>
+                <View style={styles.developerSeal}>
+                  <View pointerEvents="none" style={styles.developerSealGlow} />
+                  <Text style={styles.developerSealOverline}>
+                    {translate(language, 'DESARROLLADO POR', 'DEVELOPED BY', 'SVILUPPATO DA', '\u958b\u767a\u8005')}
+                  </Text>
+                  <Text style={styles.developerSealName}>CodeZero Interactive</Text>
+                  <Text style={styles.developerSealRights}>
+                    {translate(
+                      language,
+                      '© 2026 CodeZero Interactive. Todos los derechos reservados.',
+                      '© 2026 CodeZero Interactive. All rights reserved.',
+                      '© 2026 CodeZero Interactive. Tutti i diritti riservati.',
+                      '© 2026 CodeZero Interactive. 無断転載を禁じます。',
+                    )}
+                  </Text>
+                </View>
                 <Text style={styles.helpText}>
                   {translate(language, 'MyFinance guarda tus datos localmente en este dispositivo.', 'MyFinance stores your data locally on this device.', 'MyFinance conserva i dati localmente su questo dispositivo.', 'MyFinance\u306f\u3053\u306e\u7aef\u672b\u306b\u30c7\u30fc\u30bf\u3092\u30ed\u30fc\u30ab\u30eb\u4fdd\u5b58\u3057\u307e\u3059\u3002')}
                 </Text>
@@ -6716,10 +6946,11 @@ function createStyles(theme: AppTheme) {
     width: 46,
     height: 46,
     borderRadius: 14,
-    marginRight: uiSpacing.xs,
+    flexShrink: 0,
   },
   homeHeroTextWrap: {
     flex: 1,
+    flexShrink: 1,
     justifyContent: 'center',
     gap: 2,
   },
@@ -6731,30 +6962,17 @@ function createStyles(theme: AppTheme) {
   },
   homeHeroValue: {
     color: theme.text,
-    fontSize: 24,
+    fontSize: 28,
     fontWeight: '800',
     letterSpacing: 0.3,
+    flexShrink: 1,
+    includeFontPadding: false,
+    lineHeight: 34,
   },
   homeHeroSubLabel: {
     color: theme.textMuted,
     fontSize: uiTypography.caption,
     opacity: 0.75,
-  },
-  homeHeroVisibilityButton: {
-    minWidth: 72,
-    height: 38,
-    borderRadius: uiRadius.pill,
-    borderWidth: 1,
-    borderColor: theme.border,
-    backgroundColor: theme.surfaceAlt,
-    alignItems: 'center',
-    justifyContent: 'center',
-    paddingHorizontal: uiSpacing.sm,
-  },
-  homeHeroVisibilityButtonText: {
-    color: theme.textSoft,
-    fontSize: uiTypography.tiny,
-    fontWeight: '700',
   },
   homeStatsGrid: {
     flexDirection: 'row',
@@ -7028,6 +7246,50 @@ function createStyles(theme: AppTheme) {
     fontSize: uiTypography.caption,
     lineHeight: 20,
   },
+  developerSeal: {
+    position: 'relative',
+    overflow: 'hidden',
+    borderWidth: 1,
+    borderColor: theme.accentStrong,
+    borderRadius: uiRadius.md,
+    backgroundColor: theme.navActiveBg,
+    paddingVertical: uiSpacing.md,
+    paddingHorizontal: uiSpacing.md,
+    shadowColor: theme.accentStrong,
+    shadowOpacity: 0.34,
+    shadowRadius: 16,
+    shadowOffset: { width: 0, height: 0 },
+    elevation: 7,
+  },
+  developerSealGlow: {
+    position: 'absolute',
+    width: 138,
+    height: 138,
+    borderRadius: 69,
+    top: -74,
+    right: -30,
+    backgroundColor: theme.accentStrong,
+    opacity: 0.18,
+  },
+  developerSealOverline: {
+    color: theme.accentText,
+    fontSize: uiTypography.tiny,
+    fontWeight: '800',
+    letterSpacing: 1.1,
+  },
+  developerSealName: {
+    color: theme.text,
+    fontSize: uiTypography.body + 2,
+    fontWeight: '900',
+    letterSpacing: 0.2,
+    marginTop: 4,
+  },
+  developerSealRights: {
+    color: theme.textSoft,
+    fontSize: uiTypography.tiny,
+    lineHeight: 17,
+    marginTop: 6,
+  },
   input: {
     borderWidth: 1,
     borderColor: theme.border,
@@ -7150,6 +7412,17 @@ function createStyles(theme: AppTheme) {
     justifyContent: 'center',
     backgroundColor: theme.dangerBg,
     paddingHorizontal: uiSpacing.sm,
+  },
+  dataActionButton: {
+    flexBasis: '100%',
+    flexGrow: 0,
+    minHeight: uiHeight.button,
+    paddingVertical: uiSpacing.sm,
+    paddingHorizontal: uiSpacing.md,
+  },
+  dataActionButtonText: {
+    flexShrink: 1,
+    lineHeight: 20,
   },
   deleteCategoryButton: {
     flex: 1,
@@ -7623,8 +7896,8 @@ function createStyles(theme: AppTheme) {
     marginTop: uiSpacing.xs,
   },
   transactionsList: {
-    maxHeight: 520,
     marginTop: uiSpacing.xs,
+    gap: uiSpacing.xs,
   },
   itemRow: {
     backgroundColor: theme.surfaceAlt,

@@ -1,4 +1,5 @@
 import { getDb } from '../db/database';
+import { roundCurrencyAmount } from '../constants/currencies';
 
 export type ExchangeRateQuote = {
   base: string;
@@ -10,6 +11,7 @@ export type ExchangeRateQuote = {
 };
 
 const CACHE_TTL_MS = 1000 * 60 * 60 * 24;
+const REQUEST_TIMEOUT_MS = 12_000;
 
 function cacheKey(base: string, quote: string): string {
   return `fx_rate:${base.toUpperCase()}:${quote.toUpperCase()}`;
@@ -52,8 +54,13 @@ export async function getExchangeRate(base: string, quote: string, forceRefresh 
   const cached = await readCachedRate(normalizedBase, normalizedQuote);
   const age = cached ? Date.now() - new Date(cached.fetchedAt).getTime() : Number.POSITIVE_INFINITY;
   if (cached && !forceRefresh && Number.isFinite(age) && age < CACHE_TTL_MS) return { ...cached, fromCache: true };
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
   try {
-    const response = await fetch(`https://api.frankfurter.dev/v2/rate/${encodeURIComponent(normalizedBase)}/${encodeURIComponent(normalizedQuote)}`);
+    const response = await fetch(
+      `https://api.frankfurter.dev/v2/rate/${encodeURIComponent(normalizedBase)}/${encodeURIComponent(normalizedQuote)}`,
+      { signal: controller.signal }
+    );
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const payload: unknown = await response.json();
     if (!payload || typeof payload !== 'object') throw new Error('Invalid rate response');
@@ -72,9 +79,11 @@ export async function getExchangeRate(base: string, quote: string, forceRefresh 
   } catch (error) {
     if (cached) return { ...cached, fromCache: true };
     throw new Error('No se pudo obtener una tasa de cambio. Conéctate a Internet e inténtalo de nuevo.');
+  } finally {
+    clearTimeout(timeout);
   }
 }
 
-export function convertWithRate(amount: number, rate: number): number {
-  return Number((amount * rate).toFixed(2));
+export function convertWithRate(amount: number, rate: number, quoteCurrencyCode = 'CRC'): number {
+  return roundCurrencyAmount(amount * rate, quoteCurrencyCode);
 }

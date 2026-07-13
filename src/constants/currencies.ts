@@ -56,3 +56,12 @@ export function isSupportedCurrencyCode(value: string): value is AppCurrencyCode
 export function getCurrencyOption(code: string): CurrencyOption {
   return CURRENCY_OPTIONS.find((currency) => currency.code === code) ?? CURRENCY_OPTIONS[0];
 }
+
+export function roundCurrencyAmount(value: number, currencyCode: string): number {
+  if (!Number.isFinite(value)) {
+    return 0;
+  }
+  const decimals = getCurrencyOption(currencyCode).decimals;
+  const factor = 10 ** decimals;
+  return Math.round((value + Number.EPSILON) * factor) / factor;
+}
