@@ -126,6 +126,7 @@ import {
   validateBackupPayload,
   type BackupPayload,
 } from './src/services/backupService';
+
 import { uiElevation, uiHeight, uiRadius, uiSpacing, uiTypography } from './src/ui/tokens';
 import {
   getLanguageLabel,
@@ -135,6 +136,8 @@ import {
   localizeLegacy,
 } from './src/i18n/localization';
 import { convertWithRate, getExchangeRate } from './src/services/exchangeRateService';
+
+const PRIVACY_POLICY_URL = 'https://sebastian-retana27.github.io/MyFinance-ANDROID-/privacy.html';
 
 // Keep the native splash visible while local settings and SQLite initialize.
 void SplashScreen.preventAutoHideAsync().catch(() => undefined);
@@ -3676,6 +3679,27 @@ export default function App() {
     await Linking.openURL(mailToUrl);
   };
 
+  const onOpenPrivacyPolicy = async () => {
+    try {
+      const canOpen = await Linking.canOpenURL(PRIVACY_POLICY_URL);
+      if (!canOpen) {
+        throw new Error('Privacy policy URL is unavailable.');
+      }
+      await Linking.openURL(PRIVACY_POLICY_URL);
+    } catch {
+      Alert.alert(
+        translate(language, 'Política no disponible', 'Policy unavailable', 'Informativa non disponibile', 'ポリシーを開けません'),
+        translate(
+          language,
+          'No se pudo abrir la política de privacidad. Verifica tu conexión e inténtalo de nuevo.',
+          'The privacy policy could not be opened. Check your connection and try again.',
+          'Non è stato possibile aprire l\'informativa sulla privacy. Controlla la connessione e riprova.',
+          'プライバシーポリシーを開けませんでした。接続を確認してもう一度お試しください。'
+        )
+      );
+    }
+  };
+
   const onExportBackup = async () => {
     if (isExportingBackup) {
       backupExportCancelRef.current = true;
@@ -5989,6 +6013,11 @@ export default function App() {
                 <Text style={styles.configSectionTitle}>{getSectionLabel('support', language)}</Text>
                 <TouchableOpacity activeOpacity={BUTTON_ACTIVE_OPACITY} style={styles.secondaryButton} onPress={onContactPress}>
                   <Text style={styles.secondaryButtonText}>{t.contact}</Text>
+                </TouchableOpacity>
+                <TouchableOpacity activeOpacity={BUTTON_ACTIVE_OPACITY} style={styles.secondaryButton} onPress={() => void onOpenPrivacyPolicy()}>
+                  <Text style={styles.secondaryButtonText}>
+                    {translate(language, 'Política de privacidad', 'Privacy policy', 'Informativa sulla privacy', 'プライバシーポリシー')}
+                  </Text>
                 </TouchableOpacity>
                 <Text style={styles.helpText}>{t.buildNumber}</Text>
                 <View style={styles.developerSeal}>
