@@ -6,5 +6,6 @@ export type StoredProduct = {
   unitPrice: number;
   lineTotal: number;
   accountName: string;
+  currencyCode: string;
   createdAt: string;
 };

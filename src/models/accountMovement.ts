@@ -11,6 +11,7 @@ export type AccountMovement = {
   type: AccountMovementType;
   amount: number;
   accountName: string;
+  currencyCode: string;
   note: string;
   relatedId: number | null;
   createdAt: string;

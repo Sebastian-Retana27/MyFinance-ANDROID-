@@ -5,5 +5,6 @@ export type IncomeEntry = {
   source: IncomeEntrySource;
   amount: number;
   accountName: string;
+  currencyCode: string;
   createdAt: string;
 };

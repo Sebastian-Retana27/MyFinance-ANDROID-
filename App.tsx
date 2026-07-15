@@ -34,6 +34,7 @@ import type { Payable } from './src/models/payable';
 import type { StoredProduct } from './src/models/product';
 import type {
   MonthlyFinancialSummary,
+  AnnualMonthlySummary,
   SortDirection as RepoSortDirection,
   Transaction,
   TransactionCursor,
@@ -61,7 +62,10 @@ import { createAccountMovement } from './src/repositories/accountMovementReposit
 import { createPayable, deletePayable, listPayables, markPayablePaid } from './src/repositories/payableRepository';
 import {
   createTransaction,
+  getAnnualFinancialSummary,
   getMonthlyFinancialSummary,
+  listAnnualCategoryTotals,
+  listAnnualMonthlySummary,
   listMonthlyAccountMovementTotals,
   listTransactionsPage,
 } from './src/repositories/transactionRepository';
@@ -132,7 +136,10 @@ import {
 } from './src/i18n/localization';
 import { convertWithRate, getExchangeRate } from './src/services/exchangeRateService';
 
-type AppSection = 'inicio' | 'gastos' | 'transacciones' | 'cuentas' | 'presupuesto' | 'configuracion';
+// Keep the native splash visible while local settings and SQLite initialize.
+void SplashScreen.preventAutoHideAsync().catch(() => undefined);
+
+type AppSection = 'inicio' | 'gastos' | 'transacciones' | 'graficoAnual' | 'cuentas' | 'presupuesto' | 'configuracion';
 type TransferMode = 'received' | 'sent';
 type QuickActionMode = 'expense' | 'income' | null;
 type QuickRadialOption = 'income' | 'expense' | 'transfer' | null;
@@ -151,6 +158,7 @@ const SECTION_SYMBOLS: Record<AppSection, string> = {
   inicio: '\u2302',
   gastos: '\u20A1',
   transacciones: '\u2263',
+  graficoAnual: '\u2197',
   cuentas: '\u25A4',
   presupuesto: '\u25D4',
   configuracion: '\u2699',
@@ -1324,6 +1332,13 @@ export default function App() {
     expense: 0,
     balance: 0,
   });
+  const [annualFinancialSummary, setAnnualFinancialSummary] = useState<MonthlyFinancialSummary>({
+    income: 0,
+    expense: 0,
+    balance: 0,
+  });
+  const [annualMonthlySummary, setAnnualMonthlySummary] = useState<AnnualMonthlySummary[]>([]);
+  const [annualCategoryTotals, setAnnualCategoryTotals] = useState<Array<{ category: string; total: number }>>([]);
   const [topMovementAccountThisMonth, setTopMovementAccountThisMonth] = useState<{
     accountName: string;
     amount: number;
@@ -1443,9 +1458,9 @@ export default function App() {
     [language]
   );
   const displayCurrency = useCallback(
-    (value: number, currencyCode: string = DEFAULT_CURRENCY_CODE) =>
+    (value: number, currencyCode: string = defaultCurrencyCode) =>
       hideAmounts ? '••••••' : formatCurrency(value, language, numberFormat, currencyCode),
-    [hideAmounts, language, numberFormat]
+    [defaultCurrencyCode, hideAmounts, language, numberFormat]
   );
   const formatEditableAmount = useCallback(
     (value: string, currencyCode: string = defaultCurrencyCode) =>
@@ -1519,6 +1534,24 @@ export default function App() {
       }).format(now),
     [dateLocale, now]
   );
+  const annualMonthSeries = useMemo(() => {
+    const monthlyByNumber = new Map(annualMonthlySummary.map((summary) => [summary.month, summary]));
+
+    return Array.from({ length: 12 }, (_, index) => {
+      const month = index + 1;
+      const summary = monthlyByNumber.get(month);
+      return {
+        month,
+        income: summary?.income ?? 0,
+        expense: summary?.expense ?? 0,
+        label: new Intl.DateTimeFormat(dateLocale, { month: 'short' })
+          .format(new Date(now.getFullYear(), index, 1))
+          .replace('.', '')
+          .slice(0, 3),
+      };
+    });
+  }, [annualMonthlySummary, dateLocale, now]);
+  const annualTopCategory = annualCategoryTotals[0] ?? null;
 
   const currentMonthProducts = useMemo(() => {
     const currentYear = now.getFullYear();
@@ -1526,9 +1559,13 @@ export default function App() {
 
     return products.filter((product) => {
       const date = new Date(product.createdAt);
-      return date.getFullYear() === currentYear && date.getMonth() === currentMonth;
+      return (
+        date.getFullYear() === currentYear &&
+        date.getMonth() === currentMonth &&
+        (product.currencyCode || DEFAULT_CURRENCY_CODE) === defaultCurrencyCode
+      );
     });
-  }, [now, products]);
+  }, [defaultCurrencyCode, now, products]);
 
   const currentMonthTotal = useMemo(
     () => Number(currentMonthProducts.reduce((sum, product) => sum + product.lineTotal, 0).toFixed(2)),
@@ -1587,13 +1624,14 @@ export default function App() {
           const date = new Date(product.createdAt);
           return (
             date.getFullYear() === previousMonthDate.getFullYear() &&
-            date.getMonth() === previousMonthDate.getMonth()
+            date.getMonth() === previousMonthDate.getMonth() &&
+            (product.currencyCode || DEFAULT_CURRENCY_CODE) === defaultCurrencyCode
           );
         })
         .reduce((sum, product) => sum + product.lineTotal, 0)
         .toFixed(2)
     );
-  }, [products]);
+  }, [defaultCurrencyCode, products]);
 
   const topCategoryThisMonth = useMemo(() => {
     const totals = new Map<string, number>();
@@ -1722,8 +1760,8 @@ export default function App() {
 
   const loadMonthlyTransactionAggregates = useCallback(async () => {
     const [summary, movementByAccount] = await Promise.all([
-      getMonthlyFinancialSummary(),
-      listMonthlyAccountMovementTotals(),
+      getMonthlyFinancialSummary(undefined, defaultCurrencyCode),
+      listMonthlyAccountMovementTotals(undefined, defaultCurrencyCode),
     ]);
     setMonthlyFinancialSummary(summary);
     setTopMovementAccountThisMonth(
@@ -1734,12 +1772,27 @@ export default function App() {
           }
         : null
     );
-  }, []);
+  }, [defaultCurrencyCode]);
+
+  const loadAnnualTransactionAggregates = useCallback(async () => {
+    const [summary, months, categories] = await Promise.all([
+      getAnnualFinancialSummary(undefined, defaultCurrencyCode),
+      listAnnualMonthlySummary(undefined, defaultCurrencyCode),
+      listAnnualCategoryTotals(undefined, defaultCurrencyCode),
+    ]);
+    setAnnualFinancialSummary(summary);
+    setAnnualMonthlySummary(months);
+    setAnnualCategoryTotals(categories);
+  }, [defaultCurrencyCode]);
 
   const loadTransactions = useCallback(async () => {
     const query = buildTransactionQuery();
     const startTime = DEV_PERF_LOG ? Date.now() : 0;
-    const [page] = await Promise.all([listTransactionsPage(query, null), loadMonthlyTransactionAggregates()]);
+    const [page] = await Promise.all([
+      listTransactionsPage(query, null),
+      loadMonthlyTransactionAggregates(),
+      loadAnnualTransactionAggregates(),
+    ]);
     setTransactions(page.items);
     setTransactionsCursor(page.nextCursor);
     setTransactionsHasMore(page.hasMore);
@@ -1753,7 +1806,7 @@ export default function App() {
         })
       );
     }
-  }, [buildTransactionQuery, loadMonthlyTransactionAggregates]);
+  }, [buildTransactionQuery, loadAnnualTransactionAggregates, loadMonthlyTransactionAggregates]);
 
   const loadMoreTransactions = useCallback(async () => {
     if (!transactionsHasMore || !transactionsCursor || isTransactionsLoadingMore) {
@@ -1861,9 +1914,9 @@ export default function App() {
   }, []);
 
   const loadBudgets = useCallback(async () => {
-    const data = await listBudgets();
+    const data = await listBudgets(defaultCurrencyCode);
     setBudgets(data);
-  }, []);
+  }, [defaultCurrencyCode]);
 
   const loadPayables = useCallback(async () => {
     const data = await listPayables();
@@ -1927,6 +1980,12 @@ export default function App() {
       useNativeDriver: true,
     }).start();
   }, [contentLoadOpacity, loading]);
+
+  useEffect(() => {
+    if (!loading) {
+      void Promise.all([loadBudgets(), loadTransactions()]);
+    }
+  }, [defaultCurrencyCode, loadBudgets, loadTransactions, loading]);
 
   useEffect(() => {
     const subscription = AppState.addEventListener('change', (nextState) => {
@@ -2028,10 +2087,10 @@ export default function App() {
           localizeLegacy(language, 'Presupuesto excedido', 'Budget exceeded'),
           translate(
             language,
-            `La categoria "${categoryLabel}" supero el presupuesto.\nRestante: ${formatCurrency(remaining, language, numberFormat)}`,
-            `Category "${categoryLabel}" exceeded the budget.\nRemaining: ${formatCurrency(remaining, language, numberFormat)}`,
-            `La categoria "${categoryLabel}" ha superato il budget.\nRimanente: ${formatCurrency(remaining, language, numberFormat)}`,
-            `\u30ab\u30c6\u30b4\u30ea\u300c${categoryLabel}\u300d\u304c\u4e88\u7b97\u3092\u8d85\u3048\u307e\u3057\u305f\u3002\n\u6b8b\u308a: ${formatCurrency(remaining, language, numberFormat)}`
+            `La categoria "${categoryLabel}" supero el presupuesto.\nRestante: ${formatCurrency(remaining, language, numberFormat, defaultCurrencyCode)}`,
+            `Category "${categoryLabel}" exceeded the budget.\nRemaining: ${formatCurrency(remaining, language, numberFormat, defaultCurrencyCode)}`,
+            `La categoria "${categoryLabel}" ha superato il budget.\nRimanente: ${formatCurrency(remaining, language, numberFormat, defaultCurrencyCode)}`,
+            `\u30ab\u30c6\u30b4\u30ea\u300c${categoryLabel}\u300d\u304c\u4e88\u7b97\u3092\u8d85\u3048\u307e\u3057\u305f\u3002\n\u6b8b\u308a: ${formatCurrency(remaining, language, numberFormat, defaultCurrencyCode)}`
           )
         );
         continue;
@@ -2048,7 +2107,7 @@ export default function App() {
         )
       );
     }
-  }, [budgets, currentMonthSpentByCategory, language, now]);
+  }, [budgets, currentMonthSpentByCategory, defaultCurrencyCode, language, now]);
 
   const openDrawer = useCallback(() => {
     setIsDrawerOpen(true);
@@ -2158,7 +2217,7 @@ export default function App() {
     }
 
     try {
-      await createExpense(normalizedDescription, parsedQuantity, parsedAmount, selectedAccount.name);
+      await createExpense(normalizedDescription, parsedQuantity, parsedAmount, selectedAccount.name, undefined, selectedAccount.currencyCode);
       await createProduct(
         normalizedDescription,
         parsedQuantity,
@@ -2166,19 +2225,22 @@ export default function App() {
         manualLineTotal,
         undefined,
         manualCategory,
-        selectedAccount.name
+        selectedAccount.name,
+        selectedAccount.currencyCode
       );
       await updateAccountBalance(selectedAccount.id, roundCurrencyAmount(selectedAccount.balance - manualLineTotal, selectedAccount.currencyCode));
       await createAccountMovement({
         type: 'expense_manual',
         amount: -manualLineTotal,
         accountName: selectedAccount.name,
+        currencyCode: selectedAccount.currencyCode,
         note: normalizedDescription,
       });
       await createTransaction({
         type: 'expense',
         source: 'manual_expense',
         amount: manualLineTotal,
+        currencyCode: selectedAccount.currencyCode,
         quantity: parsedQuantity,
         category: manualCategory,
         accountName: selectedAccount.name,
@@ -2510,7 +2572,6 @@ export default function App() {
       );
       return;
     }
-
     const itemsComputedTotal = Number(
       normalizedItems.reduce((sum, item) => sum + item.lineTotal, 0).toFixed(2)
     );
@@ -2603,6 +2664,7 @@ export default function App() {
       await createProducts(itemsToSave, {
         categoryOverride: receiptCategory,
         accountName: selectedAccount.name,
+        currencyCode: selectedAccount.currencyCode,
       });
       await updateAccountBalance(
         selectedAccount.id,
@@ -2612,12 +2674,14 @@ export default function App() {
         type: 'expense_receipt',
         amount: -receiptTotal,
         accountName: selectedAccount.name,
+        currencyCode: selectedAccount.currencyCode,
         note: `Receipt items: ${normalizedItems.length}`,
       });
       await createTransaction({
         type: 'expense',
         source: 'receipt_capture',
         amount: receiptTotal,
+        currencyCode: selectedAccount.currencyCode,
         quantity: normalizedItems.reduce((sum, item) => sum + item.quantity, 0),
         category: receiptCategory,
         accountName: selectedAccount.name,
@@ -2804,17 +2868,19 @@ export default function App() {
     try {
       await updateAccountBalance(selectedAccount.id, nextBalance);
       if (transferMode === 'received') {
-        await createIncomeEntry('transfer_received', totalToApply, selectedAccount.name);
+        await createIncomeEntry('transfer_received', totalToApply, selectedAccount.name, undefined, selectedAccount.currencyCode);
         await createAccountMovement({
           type: 'transfer_in',
           amount: totalToApply,
           accountName: selectedAccount.name,
+          currencyCode: selectedAccount.currencyCode,
           note: 'Transfer received',
         });
         await createTransaction({
           type: 'transfer_in',
           source: 'transfer_capture',
           amount: totalToApply,
+          currencyCode: selectedAccount.currencyCode,
           category: FALLBACK_CATEGORY,
           accountName: selectedAccount.name,
           note: 'Transfer received',
@@ -2825,12 +2891,14 @@ export default function App() {
           type: 'transfer_out',
           amount: -totalToApply,
           accountName: selectedAccount.name,
+          currencyCode: selectedAccount.currencyCode,
           note: 'Transfer sent',
         });
         await createTransaction({
           type: 'transfer_out',
           source: 'transfer_capture',
           amount: totalToApply,
+          currencyCode: selectedAccount.currencyCode,
           category: FALLBACK_CATEGORY,
           accountName: selectedAccount.name,
           note: 'Transfer sent',
@@ -3313,13 +3381,14 @@ export default function App() {
     }
 
     try {
-      await createExpense(note, 1, parsedAmount, selectedAccount.name, createdAt);
-      await createProduct(note, 1, parsedAmount, parsedAmount, createdAt, quickExpenseCategory, selectedAccount.name);
+      await createExpense(note, 1, parsedAmount, selectedAccount.name, createdAt, selectedAccount.currencyCode);
+      await createProduct(note, 1, parsedAmount, parsedAmount, createdAt, quickExpenseCategory, selectedAccount.name, selectedAccount.currencyCode);
       await updateAccountBalance(selectedAccount.id, roundCurrencyAmount(selectedAccount.balance - parsedAmount, selectedAccount.currencyCode));
       await createAccountMovement({
         type: 'expense_manual',
         amount: -parsedAmount,
         accountName: selectedAccount.name,
+        currencyCode: selectedAccount.currencyCode,
         note,
         createdAt,
       });
@@ -3327,6 +3396,7 @@ export default function App() {
         type: 'expense',
         source: 'quick_expense',
         amount: parsedAmount,
+        currencyCode: selectedAccount.currencyCode,
         quantity: 1,
         category: quickExpenseCategory,
         accountName: selectedAccount.name,
@@ -3365,12 +3435,13 @@ export default function App() {
 
     try {
       const createdAt = new Date().toISOString();
-      await createIncomeEntry('manual_add', parsedAmount, selectedAccount.name, createdAt);
+      await createIncomeEntry('manual_add', parsedAmount, selectedAccount.name, createdAt, selectedAccount.currencyCode);
       await updateAccountBalance(selectedAccount.id, roundCurrencyAmount(selectedAccount.balance + parsedAmount, selectedAccount.currencyCode));
       await createAccountMovement({
         type: 'income_manual',
         amount: parsedAmount,
         accountName: selectedAccount.name,
+        currencyCode: selectedAccount.currencyCode,
         note: quickIncomeCategory,
         createdAt,
       });
@@ -3378,6 +3449,7 @@ export default function App() {
         type: 'income',
         source: 'quick_income',
         amount: parsedAmount,
+        currencyCode: selectedAccount.currencyCode,
         quantity: 1,
         category: quickIncomeCategory,
         accountName: selectedAccount.name,
@@ -3751,6 +3823,7 @@ export default function App() {
           type: 'account_adjustment',
           amount: roundCurrencyAmount(parsedBalance, selectedAccountCurrencyCode),
           accountName: normalizedName,
+          currencyCode: selectedAccountCurrencyCode,
           note: 'Initial account balance',
         });
       }
@@ -3783,7 +3856,7 @@ export default function App() {
     }
 
     try {
-      await upsertBudget(budgetCategory, Number(parsedAmount.toFixed(2)));
+      await upsertBudget(budgetCategory, Number(parsedAmount.toFixed(2)), defaultCurrencyCode);
       setBudgetAmountInput('');
       await loadBudgets();
       return true;
@@ -3804,7 +3877,7 @@ export default function App() {
     }
 
     try {
-      await changeBudgetAmount(category, operator * parsedAmount);
+      await changeBudgetAmount(category, operator * parsedAmount, defaultCurrencyCode);
       setBudgetDeltaInput('');
       await loadBudgets();
       setIsBudgetAdjustModalVisible(false);
@@ -3828,7 +3901,7 @@ export default function App() {
       confirmText: localizeLegacy(language, 'Eliminar', 'Delete'),
       onConfirm: async () => {
         try {
-          await deleteBudget(category);
+          await deleteBudget(category, defaultCurrencyCode);
           await loadBudgets();
         } catch (error) {
           Alert.alert(localizeLegacy(language, 'Error', 'Error'), error instanceof Error ? error.message : localizeLegacy(language, 'No se pudo eliminar el presupuesto', 'Could not delete budget'));
@@ -3860,7 +3933,7 @@ export default function App() {
     }
 
     try {
-      await createPayable(normalizedName, parsedAmount, payableCategory, parsedDueDay);
+      await createPayable(normalizedName, parsedAmount, payableCategory, parsedDueDay, defaultCurrencyCode);
       setPayableName('');
       setPayableAmountInput('');
       setPayableDueDayInput('1');
@@ -3879,6 +3952,13 @@ export default function App() {
     const selectedAccount = accounts.find((account) => account.id === payablePaymentAccountId);
     if (!selectedAccount) {
       Alert.alert(localizeLegacy(language, 'Cuenta requerida', 'Account required'), localizeLegacy(language, 'Selecciona la cuenta de pago.', 'Select the payment account.'));
+      return;
+    }
+    if (selectedAccount.currencyCode !== selectedPayableForPayment.currencyCode) {
+      Alert.alert(
+        translate(language, 'Moneda incompatible', 'Currency mismatch', 'Valute non compatibili', '通貨が一致しません'),
+        translate(language, 'Selecciona una cuenta con la misma moneda que este pago pendiente.', 'Select an account with the same currency as this payable.', 'Seleziona un conto con la stessa valuta di questa spesa fissa.', 'この支払い予定と同じ通貨の口座を選択してください。')
+      );
       return;
     }
     if (selectedAccount.balance < selectedPayableForPayment.amount) {
@@ -3901,7 +3981,8 @@ export default function App() {
         1,
         selectedPayableForPayment.amount,
         selectedAccount.name,
-        createdAt
+        createdAt,
+        selectedPayableForPayment.currencyCode
       );
       await createProduct(
         selectedPayableForPayment.name,
@@ -3910,12 +3991,14 @@ export default function App() {
         selectedPayableForPayment.amount,
         createdAt,
         selectedPayableForPayment.category,
-        selectedAccount.name
+        selectedAccount.name,
+        selectedPayableForPayment.currencyCode
       );
       await createAccountMovement({
         type: 'expense_manual',
         amount: -selectedPayableForPayment.amount,
         accountName: selectedAccount.name,
+        currencyCode: selectedPayableForPayment.currencyCode,
         note: selectedPayableForPayment.name,
         createdAt,
       });
@@ -3923,6 +4006,7 @@ export default function App() {
         type: 'expense',
         source: 'payable_payment',
         amount: selectedPayableForPayment.amount,
+        currencyCode: selectedPayableForPayment.currencyCode,
         quantity: 1,
         category: selectedPayableForPayment.category,
         accountName: selectedAccount.name,
@@ -3999,17 +4083,19 @@ export default function App() {
     try {
       await updateAccountBalance(account.id, updatedBalance);
       if (operator === 1) {
-        await createIncomeEntry('manual_add', movement, account.name);
+        await createIncomeEntry('manual_add', movement, account.name, undefined, account.currencyCode);
         await createAccountMovement({
           type: 'income_manual',
           amount: movement,
           accountName: account.name,
+          currencyCode: account.currencyCode,
           note: 'Manual income',
         });
         await createTransaction({
           type: 'income',
           source: 'manual_add',
           amount: movement,
+          currencyCode: account.currencyCode,
           category: FALLBACK_CATEGORY,
           accountName: account.name,
           note: 'Manual income',
@@ -4020,12 +4106,14 @@ export default function App() {
           type: 'account_adjustment',
           amount: -movement,
           accountName: account.name,
+          currencyCode: account.currencyCode,
           note: 'Manual account subtraction',
         });
         await createTransaction({
           type: 'expense',
           source: 'manual_subtract',
           amount: movement,
+          currencyCode: account.currencyCode,
           category: FALLBACK_CATEGORY,
           accountName: account.name,
           note: 'Manual account subtraction',
@@ -4074,18 +4162,26 @@ export default function App() {
       return;
     }
 
-    const applyCurrency = async () => {
+    const applyCurrency = async (convertBalance: boolean) => {
       try {
+        let nextBalance = selectedAccountForAction.balance;
+        if (convertBalance && nextBalance !== 0) {
+          const quote = await getExchangeRate(selectedAccountForAction.currencyCode, currencyCode);
+          nextBalance = convertWithRate(nextBalance, quote.rate, currencyCode);
+        }
+        if (convertBalance) {
+          await updateAccountBalance(selectedAccountForAction.id, nextBalance);
+        }
         await updateAccountCurrency(selectedAccountForAction.id, currencyCode);
         await loadAccounts();
-        setSelectedAccountForAction((prev) => (prev ? { ...prev, currencyCode } : prev));
+        setSelectedAccountForAction((prev) => (prev ? { ...prev, balance: nextBalance, currencyCode } : prev));
         setIsAccountActionCurrencyDropdownOpen(false);
       } catch (error) {
         Alert.alert(
           translate(language, 'Error', 'Error', 'Errore', '\u30a8\u30e9\u30fc'),
           error instanceof Error
             ? error.message
-            : translate(language, 'No se pudo actualizar la moneda.', 'Could not update currency.', 'Impossibile aggiornare la valuta.', '\u901a\u8ca8\u3092\u66f4\u65b0\u3067\u304d\u307e\u305b\u3093\u3067\u3057\u305f\u3002')
+            : translate(language, 'No se pudo actualizar la moneda. Conéctate a Internet si elegiste convertir el saldo.', 'Could not update the currency. Connect to the Internet if you chose to convert the balance.', 'Non è stato possibile aggiornare la valuta. Connettiti a Internet se hai scelto di convertire il saldo.', '\u901a\u8ca8\u3092\u66f4\u65b0\u3067\u304d\u307e\u305b\u3093\u3067\u3057\u305f\u3002\u6b8b\u9ad8\u3092\u63db\u7b97\u3059\u308b\u5834\u5408\u306f\u30a4\u30f3\u30bf\u30fc\u30cd\u30c3\u30c8\u306b\u63a5\u7d9a\u3057\u3066\u304f\u3060\u3055\u3044\u3002')
         );
       }
     };
@@ -4094,14 +4190,15 @@ export default function App() {
       translate(language, 'Cambiar moneda de la cuenta', 'Change account currency', 'Cambia valuta del conto', '\u53e3\u5ea7\u901a\u8ca8\u3092\u5909\u66f4'),
       translate(
         language,
-        'Esto cambia la etiqueta de moneda del saldo actual; no realiza una conversión. Confirma solo si el saldo ya está expresado en la nueva moneda.',
-        'This only changes the currency label of the current balance; it does not convert it. Confirm only if the balance is already expressed in the new currency.',
-        'Questa operazione cambia l\u2019etichetta della valuta del saldo corrente; non effettua una conversione. Conferma solo se il saldo \u00e8 gi\u00e0 espresso nella nuova valuta.',
-        '\u3053\u308c\u306f\u73fe\u5728\u306e\u6b8b\u9ad8\u306e\u901a\u8ca8\u8868\u793a\u3092\u5909\u66f4\u3059\u308b\u3060\u3051\u3067\u3001\u63db\u7b97\u306f\u884c\u3044\u307e\u305b\u3093\u3002\u6b8b\u9ad8\u304c\u65e2\u306b\u65b0\u3057\u3044\u901a\u8ca8\u3067\u8868\u793a\u3055\u308c\u3066\u3044\u308b\u5834\u5408\u306e\u307f\u78ba\u8a8d\u3057\u3066\u304f\u3060\u3055\u3044\u3002'
+        'Elige si el saldo actual ya está expresado en la nueva moneda o si deseas convertirlo con una tasa de cambio. La conversión puede usar una tasa guardada o requerir Internet.',
+        'Choose whether the current balance is already expressed in the new currency or should be converted using an exchange rate. Conversion may use a saved rate or require Internet access.',
+        'Scegli se il saldo attuale è già espresso nella nuova valuta o se deve essere convertito con un tasso di cambio. La conversione può usare un tasso salvato o richiedere Internet.',
+        '\u73fe\u5728\u306e\u6b8b\u9ad8\u304c\u65e2\u306b\u65b0\u3057\u3044\u901a\u8ca8\u3067\u8868\u793a\u3055\u308c\u3066\u3044\u308b\u304b\u3001\u70ba\u66ff\u30ec\u30fc\u30c8\u3067\u63db\u7b97\u3059\u308b\u304b\u3092\u9078\u629e\u3057\u3066\u304f\u3060\u3055\u3044\u3002\u63db\u7b97\u306b\u306f\u4fdd\u5b58\u6e08\u307f\u30ec\u30fc\u30c8\u307e\u305f\u306f\u30a4\u30f3\u30bf\u30fc\u30cd\u30c3\u30c8\u63a5\u7d9a\u304c\u5fc5\u8981\u306b\u306a\u308b\u5834\u5408\u304c\u3042\u308a\u307e\u3059\u3002'
       ),
       [
         { text: translate(language, 'Cancelar', 'Cancel', 'Annulla', '\u30ad\u30e3\u30f3\u30bb\u30eb'), style: 'cancel' },
-        { text: translate(language, 'Cambiar', 'Change', 'Cambia', '\u5909\u66f4'), onPress: () => void applyCurrency() },
+        { text: translate(language, 'Conservar monto', 'Keep amount', 'Mantieni importo', '\u91d1\u984d\u3092\u7dad\u6301'), onPress: () => void applyCurrency(false) },
+        { text: translate(language, 'Convertir saldo', 'Convert balance', 'Converti saldo', '\u6b8b\u9ad8\u3092\u63db\u7b97'), onPress: () => void applyCurrency(true) },
       ]
     );
   };
@@ -4225,18 +4322,21 @@ export default function App() {
         type: 'transfer_out',
         amount: -parsed,
         accountName: from.name,
+        currencyCode: from.currencyCode,
         note: `Internal transfer to ${to.name}${conversionNote}`,
       });
       await createAccountMovement({
         type: 'transfer_in',
         amount: destinationAmount,
         accountName: to.name,
+        currencyCode: to.currencyCode,
         note: `Internal transfer from ${from.name}${conversionNote}`,
       });
       await createTransaction({
         type: 'transfer_out',
         source: 'internal_transfer',
         amount: parsed,
+        currencyCode: from.currencyCode,
         accountName: from.name,
         category: FALLBACK_CATEGORY,
         note: `Internal transfer to ${to.name}${conversionNote}`,
@@ -4245,6 +4345,7 @@ export default function App() {
         type: 'transfer_in',
         source: 'internal_transfer',
         amount: destinationAmount,
+        currencyCode: to.currencyCode,
         accountName: to.name,
         category: FALLBACK_CATEGORY,
         note: `Internal transfer from ${from.name}${conversionNote}`,
@@ -4301,6 +4402,9 @@ export default function App() {
         </TouchableOpacity>
         <Text style={styles.sectionTitle}>{t.budgetByCategory}</Text>
       </View>
+      <Text style={styles.helpText}>
+        {translate(language, 'Moneda de análisis', 'Analysis currency', 'Valuta di analisi', '分析通貨')}: {defaultCurrencyCode}
+      </Text>
       {budgets.length === 0 ? (
         <Text style={styles.empty}>{t.noBudgets}</Text>
       ) : (
@@ -4366,6 +4470,9 @@ export default function App() {
         </TouchableOpacity>
         <Text style={styles.sectionTitle}>{translate(language, 'Por pagar', 'Payables', 'Da pagare', '支払い予定')}</Text>
       </View>
+      <Text style={styles.helpText}>
+        {translate(language, 'Cada pago conserva su propia moneda.', 'Each payable keeps its own currency.', 'Ogni pagamento mantiene la propria valuta.', '各支払い予定は独自の通貨を保持します。')}
+      </Text>
       {payables.length === 0 ? (
         <Text style={styles.empty}>{translate(language, 'No hay gastos fijos configurados.', 'No fixed expenses configured.', 'Non ci sono spese fisse configurate.', '固定費は設定されていません。')}</Text>
       ) : (
@@ -4377,7 +4484,7 @@ export default function App() {
                   <View style={[styles.payableStatusDot, payable.isPaid ? styles.payableStatusPaid : styles.payableStatusPending]} />
                   <Text style={styles.itemDesc}>{payable.name}</Text>
                 </View>
-                <Text style={styles.itemAmount}>{displayCurrency(payable.amount)}</Text>
+                <Text style={styles.itemAmount}>{displayCurrency(payable.amount, payable.currencyCode)}</Text>
               </View>
               <Text style={styles.homeBudgetDetails}>
                 {getCategoryLabel(payable.category, language)} · {translate(language, 'Día', 'Day', 'Giorno', '日')} {payable.dueDay} · {payable.isPaid ? translate(language, 'Pagado', 'Paid', 'Pagato', '支払済み') : translate(language, 'Pendiente', 'Pending', 'In attesa', '保留中')}
@@ -4597,6 +4704,71 @@ export default function App() {
       </View>
     );
   };
+  const renderAnnualTrendChart = (): ReactElement => {
+    const hasAnnualData = annualMonthSeries.some((item) => item.income > 0 || item.expense > 0);
+    const padding = 14;
+    const graphWidth = chartSize - padding * 2;
+    const graphHeight = chartSize - padding * 2;
+
+    if (!hasAnnualData) {
+      return (
+        <View style={styles.chartWrap}>
+          <View style={[styles.emptyChart, { borderColor: chartTrackColor }]} />
+          <View style={styles.chartCenter}>
+            <Text style={styles.chartCenterValue}>{displayCurrency(0)}</Text>
+            <Text style={styles.chartCenterSub}>{translate(language, 'Año', 'Year', 'Anno', '年')}</Text>
+          </View>
+        </View>
+      );
+    }
+
+    const maxValue = Math.max(
+      ...annualMonthSeries.flatMap((item) => [item.income, item.expense]),
+      1
+    );
+    const getPoint = (index: number, value: number) => ({
+      x: padding + (graphWidth * index) / (annualMonthSeries.length - 1),
+      y: padding + graphHeight - (value / maxValue) * graphHeight,
+    });
+    const pointsFor = (key: 'income' | 'expense') =>
+      annualMonthSeries
+        .map((item, index) => {
+          const point = getPoint(index, item[key]);
+          return `${point.x},${point.y}`;
+        })
+        .join(' ');
+
+    return (
+      <View style={styles.chartWrap}>
+        <Svg width={chartSize} height={chartSize}>
+          <Line
+            x1={padding}
+            y1={padding + graphHeight}
+            x2={padding + graphWidth}
+            y2={padding + graphHeight}
+            stroke={chartTrackColor}
+            strokeWidth={1}
+          />
+          <Polyline
+            points={pointsFor('income')}
+            fill="none"
+            stroke={theme.accentStrong}
+            strokeWidth={3}
+            strokeLinejoin="round"
+            strokeLinecap="round"
+          />
+          <Polyline
+            points={pointsFor('expense')}
+            fill="none"
+            stroke={theme.dangerBorder}
+            strokeWidth={3}
+            strokeLinejoin="round"
+            strokeLinecap="round"
+          />
+        </Svg>
+      </View>
+    );
+  };
   const statusBarStyle = themeMode === 'light' ? 'dark' : 'light';
   const canSaveManualExpense = useMemo(() => {
     const parsedQuantity = Number(quantity);
@@ -4666,7 +4838,7 @@ export default function App() {
           </View>
           <Text style={[styles.itemAmount, signedAmount < 0 ? styles.negativeBudget : undefined]}>
             {signedAmount < 0 ? '-' : '+'}
-            {displayCurrency(Math.abs(signedAmount))}
+            {displayCurrency(Math.abs(signedAmount), item.currencyCode)}
           </Text>
         </View>
       );
@@ -4943,6 +5115,8 @@ export default function App() {
                 ? localizeLegacy(language, 'Sube y revisa recibos con OCR.', 'Upload and review receipts with OCR.')
                 : activeSection === 'transacciones'
                   ? t.subtitleTransacciones
+                : activeSection === 'graficoAnual'
+                  ? translate(language, 'Tu panorama financiero del año.', 'Your financial overview for the year.', 'La tua panoramica finanziaria dell\'anno.', '年間の資金状況を確認できます。')
                 : activeSection === 'cuentas'
                   ? ''
                   : activeSection === 'configuracion'
@@ -4996,6 +5170,9 @@ export default function App() {
 
               <View style={styles.card}>
                 <Text style={styles.sectionTitle}>{localizeLegacy(language, 'Resumen mensual', 'Monthly summary')}</Text>
+                <Text style={styles.helpText}>
+                  {translate(language, 'Moneda de análisis', 'Analysis currency', 'Valuta di analisi', '分析通貨')}: {defaultCurrencyCode}
+                </Text>
                 <View style={styles.homeSectionGrid}>
                   <View style={styles.homeSectionMiniCard}>
                     <Text style={styles.homeStatTitle}>{localizeLegacy(language, 'Ingresos del mes', 'Monthly income')}</Text>
@@ -5014,7 +5191,9 @@ export default function App() {
 
               <View style={[styles.card, styles.homeChartCard]}>
                 <Text style={styles.sectionTitle}>{t.spendingStructure}</Text>
-                <Text style={styles.helpText}>{capitalize(currentMonthLabel)}</Text>
+                <Text style={styles.helpText}>
+                  {capitalize(currentMonthLabel)} · {defaultCurrencyCode}
+                </Text>
                 <View style={styles.chartContentRow}>
                   {renderHomeChartVisual()}
                 </View>
@@ -5039,6 +5218,65 @@ export default function App() {
               {renderPayablesOverview()}
               {renderBudgetOverview()}
 
+            </>
+          ) : null}
+
+          {activeSection === 'graficoAnual' ? (
+            <>
+              <View style={styles.card}>
+                <Text style={styles.sectionTitle}>{translate(language, 'Resumen anual', 'Annual summary', 'Riepilogo annuale', '年間概要')}</Text>
+                <Text style={styles.helpText}>{now.getFullYear()} · {defaultCurrencyCode}</Text>
+                <View style={styles.annualSummaryGrid}>
+                  <View style={styles.annualSummaryCard}>
+                    <Text style={styles.homeStatTitle}>{translate(language, 'Ingresos del año', 'Year income', 'Entrate annuali', '年間収入')}</Text>
+                    <Text style={styles.homeStatValue}>{displayCurrency(annualFinancialSummary.income)}</Text>
+                  </View>
+                  <View style={styles.annualSummaryCard}>
+                    <Text style={styles.homeStatTitle}>{translate(language, 'Gastos del año', 'Year expenses', 'Spese annuali', '年間支出')}</Text>
+                    <Text style={styles.homeStatValue}>{displayCurrency(annualFinancialSummary.expense)}</Text>
+                  </View>
+                  <View style={[styles.annualSummaryCard, styles.annualSummaryWideCard]}>
+                    <Text style={styles.homeStatTitle}>{translate(language, 'Balance anual', 'Annual balance', 'Saldo annuale', '年間収支')}</Text>
+                    <Text style={styles.homeStatValue}>{displayCurrency(annualFinancialSummary.balance)}</Text>
+                  </View>
+                </View>
+              </View>
+
+              <View style={[styles.card, styles.homeChartCard]}>
+                <Text style={styles.sectionTitle}>{translate(language, 'Ingresos y gastos por mes', 'Monthly income and expenses', 'Entrate e spese mensili', '月別の収入と支出')}</Text>
+                <Text style={styles.helpText}>{now.getFullYear()}</Text>
+                {renderAnnualTrendChart()}
+                <View style={styles.annualChartLegend}>
+                  <View style={styles.annualLegendItem}>
+                    <View style={[styles.annualLegendDot, { backgroundColor: theme.accentStrong }]} />
+                    <Text style={styles.annualLegendText}>{translate(language, 'Ingresos', 'Income', 'Entrate', '収入')}</Text>
+                  </View>
+                  <View style={styles.annualLegendItem}>
+                    <View style={[styles.annualLegendDot, { backgroundColor: theme.dangerBorder }]} />
+                    <Text style={styles.annualLegendText}>{translate(language, 'Gastos', 'Expenses', 'Spese', '支出')}</Text>
+                  </View>
+                </View>
+                <View style={styles.annualMonthLabels}>
+                  {annualMonthSeries.map((item) => (
+                    <Text key={`annual-month-${item.month}`} numberOfLines={1} style={styles.annualMonthLabel}>
+                      {item.label}
+                    </Text>
+                  ))}
+                </View>
+              </View>
+
+              <View style={styles.card}>
+                <Text style={styles.sectionTitle}>{translate(language, 'Categoría con mayor gasto', 'Top spending category', 'Categoria con più spese', '支出が最も多いカテゴリ')}</Text>
+                {annualTopCategory ? (
+                  <View style={styles.annualTopCategoryRow}>
+                    <View style={[styles.legendDot, { backgroundColor: getChartSliceColor(annualTopCategory.category) }]} />
+                    <Text style={styles.annualTopCategoryName}>{getCategoryLabel(annualTopCategory.category, language)}</Text>
+                    <Text style={styles.annualTopCategoryAmount}>{displayCurrency(annualTopCategory.total)}</Text>
+                  </View>
+                ) : (
+                  <Text style={styles.empty}>{translate(language, 'Aún no hay movimientos para este año.', 'There are no movements for this year yet.', 'Non ci sono ancora movimenti per quest\'anno.', '今年の取引はまだありません。')}</Text>
+                )}
+              </View>
             </>
           ) : null}
 
@@ -5395,7 +5633,7 @@ export default function App() {
                         </Text>
                       </View>
                       <View style={[styles.productActionWrap, styles.budgetActionsWrap]}>
-                        <Text style={styles.itemAmount}>{displayCurrency(payable.amount)}</Text>
+                        <Text style={styles.itemAmount}>{displayCurrency(payable.amount, payable.currencyCode)}</Text>
                         {!payable.isPaid ? (
                           <TouchableOpacity
                             activeOpacity={BUTTON_ACTIVE_OPACITY}
@@ -5819,6 +6057,20 @@ export default function App() {
                   </Text>
                   <Text style={[styles.drawerItemText, activeSection === 'gastos' ? styles.drawerItemTextActive : undefined]}>
                     {localizeLegacy(language, 'Recibos', 'Receipts')}
+                  </Text>
+                </View>
+              </TouchableOpacity>
+              <TouchableOpacity
+                activeOpacity={BUTTON_ACTIVE_OPACITY}
+                style={[styles.drawerItem, activeSection === 'graficoAnual' ? styles.drawerItemActive : undefined]}
+                onPress={() => onChangeSection('graficoAnual')}
+              >
+                <View style={styles.drawerItemRow}>
+                  <Text style={[styles.drawerItemIcon, activeSection === 'graficoAnual' ? styles.drawerItemTextActive : undefined]}>
+                    {SECTION_SYMBOLS.graficoAnual}
+                  </Text>
+                  <Text style={[styles.drawerItemText, activeSection === 'graficoAnual' ? styles.drawerItemTextActive : undefined]}>
+                    {translate(language, 'Gráfico Anual', 'Annual Chart', 'Grafico annuale', '年間グラフ')}
                   </Text>
                 </View>
               </TouchableOpacity>
@@ -6310,7 +6562,7 @@ export default function App() {
             <TextInput
               placeholder={t.amount}
               value={budgetDeltaInput}
-              onChangeText={(value) => setBudgetDeltaInput(formatEditableAmount(value))}
+              onChangeText={(value) => setBudgetDeltaInput(formatEditableAmount(value, defaultCurrencyCode))}
               keyboardType="decimal-pad"
               style={styles.input}
               placeholderTextColor={theme.placeholder}
@@ -6385,11 +6637,14 @@ export default function App() {
             <TextInput
               placeholder={t.maxBudget}
               value={budgetAmountInput}
-              onChangeText={(value) => setBudgetAmountInput(formatEditableAmount(value))}
+              onChangeText={(value) => setBudgetAmountInput(formatEditableAmount(value, defaultCurrencyCode))}
               keyboardType="decimal-pad"
               style={styles.input}
               placeholderTextColor={theme.placeholder}
             />
+            <Text style={styles.helpText}>
+              {translate(language, 'Moneda de este presupuesto', 'Currency for this budget', 'Valuta di questo budget', 'この予算の通貨')}: {defaultCurrencyCode}
+            </Text>
             <TouchableOpacity activeOpacity={BUTTON_ACTIVE_OPACITY}
               style={[styles.primaryButton, availableBudgetCategories.length === 0 ? styles.primaryButtonDisabled : undefined]}
               onPress={async () => {
@@ -6429,11 +6684,14 @@ export default function App() {
             <TextInput
               placeholder={t.amount}
               value={payableAmountInput}
-              onChangeText={(value) => setPayableAmountInput(formatEditableAmount(value))}
+              onChangeText={(value) => setPayableAmountInput(formatEditableAmount(value, defaultCurrencyCode))}
               keyboardType="decimal-pad"
               style={styles.input}
               placeholderTextColor={theme.placeholder}
             />
+            <Text style={styles.helpText}>
+              {translate(language, 'Moneda de este pago', 'Currency for this payable', 'Valuta di questo pagamento', 'この支払いの通貨')}: {defaultCurrencyCode}
+            </Text>
             <TextInput
               placeholder={localizeLegacy(language, 'Día de pago (1-31)', 'Due day (1-31)')}
               value={payableDueDayInput}
@@ -6490,12 +6748,12 @@ export default function App() {
             <Text style={styles.sectionTitle}>{localizeLegacy(language, 'Pagar gasto fijo', 'Pay fixed expense')}</Text>
             <Text style={styles.helpText}>
               {selectedPayableForPayment
-                ? `${selectedPayableForPayment.name} · ${displayCurrency(selectedPayableForPayment.amount)}`
+                ? `${selectedPayableForPayment.name} · ${displayCurrency(selectedPayableForPayment.amount, selectedPayableForPayment.currencyCode)}`
                 : ''}
             </Text>
             <Text style={styles.filterLabel}>{localizeLegacy(language, 'Cuenta de pago', 'Payment account')}</Text>
             <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.chipScroll}>
-              {accounts.map((account) => (
+              {accounts.filter((account) => account.currencyCode === selectedPayableForPayment?.currencyCode).map((account) => (
                 <TouchableOpacity
                   activeOpacity={BUTTON_ACTIVE_OPACITY}
                   key={`payable-payment-account-${account.id}`}
@@ -7013,6 +7271,28 @@ function createStyles(theme: AppTheme) {
     ...uiElevation.card,
   },
   homeSectionWideCard: {
+    width: '100%',
+  },
+  annualSummaryGrid: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    rowGap: uiSpacing.sm,
+    columnGap: uiSpacing.xs,
+  },
+  annualSummaryCard: {
+    width: '48%',
+    minHeight: 76,
+    backgroundColor: theme.surfaceAlt,
+    borderWidth: 1,
+    borderColor: theme.borderStrong,
+    borderRadius: uiRadius.md,
+    paddingVertical: uiSpacing.sm,
+    paddingHorizontal: uiSpacing.sm,
+    justifyContent: 'center',
+    gap: 5,
+    ...uiElevation.card,
+  },
+  annualSummaryWideCard: {
     width: '100%',
   },
   homeStatTitle: {
@@ -7618,6 +7898,57 @@ function createStyles(theme: AppTheme) {
     backgroundColor: theme.surfaceAlt,
     padding: uiSpacing.xs,
     justifyContent: 'center',
+  },
+  annualChartLegend: {
+    flexDirection: 'row',
+    justifyContent: 'center',
+    gap: uiSpacing.md,
+    marginTop: uiSpacing.xxs,
+  },
+  annualLegendItem: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+  },
+  annualLegendDot: {
+    width: 9,
+    height: 9,
+    borderRadius: 5,
+  },
+  annualLegendText: {
+    color: theme.textMuted,
+    fontSize: uiTypography.tiny,
+    fontWeight: '700',
+  },
+  annualMonthLabels: {
+    width: 142,
+    alignSelf: 'center',
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+  },
+  annualMonthLabel: {
+    width: 11,
+    color: theme.textMuted,
+    fontSize: 8,
+    fontWeight: '600',
+    textAlign: 'center',
+  },
+  annualTopCategoryRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: uiSpacing.xs,
+    minHeight: 32,
+  },
+  annualTopCategoryName: {
+    flex: 1,
+    color: theme.text,
+    fontSize: uiTypography.body,
+    fontWeight: '700',
+  },
+  annualTopCategoryAmount: {
+    color: theme.amountColor,
+    fontSize: uiTypography.body,
+    fontWeight: '800',
   },
   emptyChart: {
     width: 142,

@@ -83,6 +83,9 @@ export async function getSavedThemeMode(): Promise<AppThemeMode> {
   if (row.value === 'original') {
     return 'original';
   }
+  if (row.value === 'dark') {
+    return 'dark';
+  }
   return 'original';
 }
 

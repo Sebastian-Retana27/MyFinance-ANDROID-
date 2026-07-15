@@ -1,4 +1,5 @@
 import { getDb } from '../db/database';
+import { DEFAULT_CURRENCY_CODE } from '../constants/currencies';
 import type { StoredProduct } from '../models/product';
 import type { ReceiptItem } from '../services/receiptAnalyzer';
 import { detectProductCategory } from '../services/categoryService';
@@ -10,20 +11,22 @@ export async function createProduct(
   lineTotal: number,
   createdAt?: string,
   categoryOverride?: string,
-  accountName?: string
+  accountName?: string,
+  currencyCode: string = DEFAULT_CURRENCY_CODE
 ): Promise<void> {
   const db = await getDb();
   const category = categoryOverride ?? detectProductCategory(name);
   const createdAtValue = createdAt ?? new Date().toISOString();
 
   await db.runAsync(
-    'INSERT INTO products (name, category, quantity, unit_price, line_total, account_name, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
+    'INSERT INTO products (name, category, quantity, unit_price, line_total, account_name, currency_code, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
     name,
     category,
     quantity,
     unitPrice,
     lineTotal,
     accountName ?? '',
+    currencyCode,
     createdAtValue
   );
 }
@@ -31,6 +34,7 @@ export async function createProduct(
 type CreateProductsOptions = {
   categoryOverride?: string;
   accountName?: string;
+  currencyCode?: string;
   createdAt?: string;
 };
 
@@ -46,13 +50,14 @@ export async function createProducts(items: ReceiptItem[], options?: CreateProdu
     for (const item of items) {
       const category = options?.categoryOverride ?? detectProductCategory(item.name);
       await tx.runAsync(
-        'INSERT INTO products (name, category, quantity, unit_price, line_total, account_name, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
+        'INSERT INTO products (name, category, quantity, unit_price, line_total, account_name, currency_code, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
         item.name,
         category,
         item.quantity,
         item.unitPrice,
         item.lineTotal,
         options?.accountName ?? '',
+        options?.currencyCode ?? DEFAULT_CURRENCY_CODE,
         createdAt
       );
     }
@@ -70,10 +75,11 @@ export async function listProducts(): Promise<StoredProduct[]> {
     unit_price: number;
     line_total: number;
     account_name: string;
+    currency_code: string;
     created_at: string;
   }>(
     `
-      SELECT id, name, category, quantity, unit_price, line_total, account_name, created_at
+      SELECT id, name, category, quantity, unit_price, line_total, account_name, currency_code, created_at
       FROM products
       WHERE COALESCE(is_deleted, 0) = 0
       ORDER BY created_at DESC, id DESC
@@ -88,6 +94,7 @@ export async function listProducts(): Promise<StoredProduct[]> {
     unitPrice: row.unit_price,
     lineTotal: row.line_total,
     accountName: row.account_name,
+    currencyCode: row.currency_code || DEFAULT_CURRENCY_CODE,
     createdAt: row.created_at,
   }));
 }
@@ -112,7 +119,7 @@ export async function syncProductsFromExpenses(): Promise<void> {
   }
 
   await db.runAsync(`
-    INSERT INTO products (name, category, quantity, unit_price, line_total, account_name, created_at)
+    INSERT INTO products (name, category, quantity, unit_price, line_total, account_name, currency_code, created_at)
     SELECT
       e.description,
       'varios',
@@ -120,6 +127,7 @@ export async function syncProductsFromExpenses(): Promise<void> {
       e.amount,
       ROUND(e.amount * e.quantity, 2),
       e.account_name,
+      COALESCE(NULLIF(e.currency_code, ''), 'CRC'),
       e.created_at
     FROM expenses e
     WHERE NOT EXISTS (

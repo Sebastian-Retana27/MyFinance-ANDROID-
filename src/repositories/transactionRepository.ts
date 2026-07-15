@@ -1,6 +1,8 @@
 import { getDb } from '../db/database';
+import { DEFAULT_CURRENCY_CODE } from '../constants/currencies';
 import type {
   AccountMovementTotal,
+  AnnualMonthlySummary,
   CategoryTotal,
   MonthlyFinancialSummary,
   MonthlyTransactionSummary,
@@ -17,6 +19,7 @@ type CreateTransactionInput = {
   type: TransactionType;
   source?: string;
   amount: number;
+  currencyCode?: string;
   quantity?: number;
   category?: string;
   accountName?: string;
@@ -32,6 +35,7 @@ function mapTransactionRow(row: {
   type: string;
   source: string;
   amount: number;
+  currency_code: string;
   quantity: number;
   category: string;
   account_name: string;
@@ -47,6 +51,7 @@ function mapTransactionRow(row: {
         : 'expense',
     source: row.source,
     amount: row.amount,
+    currencyCode: row.currency_code || DEFAULT_CURRENCY_CODE,
     quantity: row.quantity,
     category: row.category,
     accountName: row.account_name,
@@ -159,6 +164,13 @@ function toMonthBounds(referenceDate?: string): { start: string; end: string } {
   return { start: start.toISOString(), end: end.toISOString() };
 }
 
+function toYearBounds(referenceDate?: string): { start: string; end: string } {
+  const base = referenceDate ? new Date(referenceDate) : new Date();
+  const start = new Date(base.getFullYear(), 0, 1);
+  const end = new Date(base.getFullYear() + 1, 0, 1);
+  return { start: start.toISOString(), end: end.toISOString() };
+}
+
 export async function createTransaction(input: CreateTransactionInput): Promise<void> {
   const db = await getDb();
   const quantity = input.quantity ?? 1;
@@ -171,17 +183,19 @@ export async function createTransaction(input: CreateTransactionInput): Promise<
         type,
         source,
         amount,
+        currency_code,
         quantity,
         category,
         account_name,
         note,
         related_id,
         created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `,
     input.type,
     input.source ?? '',
     Number(input.amount.toFixed(2)),
+    input.currencyCode ?? DEFAULT_CURRENCY_CODE,
     quantity,
     category,
     input.accountName ?? '',
@@ -238,6 +252,7 @@ export async function listTransactionsPage(
     type: string;
     source: string;
     amount: number;
+    currency_code: string;
     quantity: number;
     category: string;
     account_name: string;
@@ -246,7 +261,7 @@ export async function listTransactionsPage(
     created_at: string;
   }>(
     `
-      SELECT id, type, source, amount, quantity, category, account_name, note, related_id, created_at
+      SELECT id, type, source, amount, currency_code, quantity, category, account_name, note, related_id, created_at
       FROM transactions
       ${whereSql}
       ${orderSql}
@@ -281,16 +296,18 @@ export async function listMonthlySummary(): Promise<MonthlyTransactionSummary[]>
 
   const rows = await db.getAllAsync<{
     month_key: string;
+    currency_code: string;
     total_expense: number;
     total_income: number;
   }>(`
     SELECT
       strftime('%Y-%m', created_at) AS month_key,
+      currency_code,
       ROUND(SUM(CASE WHEN type IN ('expense', 'transfer_out') THEN amount ELSE 0 END), 2) AS total_expense,
       ROUND(SUM(CASE WHEN type IN ('income', 'transfer_in') THEN amount ELSE 0 END), 2) AS total_income
     FROM transactions
-    GROUP BY month_key
-    ORDER BY month_key DESC
+    GROUP BY month_key, currency_code
+    ORDER BY month_key DESC, currency_code ASC
   `);
 
   return rows.map((row) => {
@@ -299,6 +316,7 @@ export async function listMonthlySummary(): Promise<MonthlyTransactionSummary[]>
 
     return {
       monthKey: row.month_key,
+      currencyCode: row.currency_code || DEFAULT_CURRENCY_CODE,
       totalExpense,
       totalIncome,
       net: Number((totalIncome - totalExpense).toFixed(2)),
@@ -306,7 +324,7 @@ export async function listMonthlySummary(): Promise<MonthlyTransactionSummary[]>
   });
 }
 
-export async function getMonthlyFinancialSummary(referenceDate?: string): Promise<MonthlyFinancialSummary> {
+export async function getMonthlyFinancialSummary(referenceDate?: string, currencyCode = DEFAULT_CURRENCY_CODE): Promise<MonthlyFinancialSummary> {
   const db = await getDb();
   const bounds = toMonthBounds(referenceDate);
 
@@ -319,10 +337,11 @@ export async function getMonthlyFinancialSummary(referenceDate?: string): Promis
         ROUND(SUM(CASE WHEN type IN ('income', 'transfer_in') THEN amount ELSE 0 END), 2) AS income,
         ROUND(SUM(CASE WHEN type IN ('expense', 'transfer_out') THEN amount ELSE 0 END), 2) AS expense
       FROM transactions
-      WHERE created_at >= ? AND created_at < ?
+      WHERE created_at >= ? AND created_at < ? AND currency_code = ?
     `,
     bounds.start,
-    bounds.end
+    bounds.end,
+    currencyCode
   );
 
   const income = Number(row?.income ?? 0);
@@ -334,7 +353,80 @@ export async function getMonthlyFinancialSummary(referenceDate?: string): Promis
   };
 }
 
-export async function listMonthlyCategoryTotals(referenceDate?: string): Promise<CategoryTotal[]> {
+export async function getAnnualFinancialSummary(referenceDate?: string, currencyCode = DEFAULT_CURRENCY_CODE): Promise<MonthlyFinancialSummary> {
+  const db = await getDb();
+  const bounds = toYearBounds(referenceDate);
+  const row = await db.getFirstAsync<{ income: number; expense: number }>(
+    `
+      SELECT
+        ROUND(SUM(CASE WHEN type IN ('income', 'transfer_in') THEN amount ELSE 0 END), 2) AS income,
+        ROUND(SUM(CASE WHEN type IN ('expense', 'transfer_out') THEN amount ELSE 0 END), 2) AS expense
+      FROM transactions
+      WHERE created_at >= ? AND created_at < ? AND currency_code = ?
+    `,
+    bounds.start,
+    bounds.end,
+    currencyCode
+  );
+  const income = Number(row?.income ?? 0);
+  const expense = Number(row?.expense ?? 0);
+  return { income, expense, balance: Number((income - expense).toFixed(2)) };
+}
+
+export async function listAnnualMonthlySummary(referenceDate?: string, currencyCode = DEFAULT_CURRENCY_CODE): Promise<AnnualMonthlySummary[]> {
+  const db = await getDb();
+  const bounds = toYearBounds(referenceDate);
+  const rows = await db.getAllAsync<{ month: string; income: number; expense: number }>(
+    `
+      SELECT
+        strftime('%m', created_at) AS month,
+        ROUND(SUM(CASE WHEN type IN ('income', 'transfer_in') THEN amount ELSE 0 END), 2) AS income,
+        ROUND(SUM(CASE WHEN type IN ('expense', 'transfer_out') THEN amount ELSE 0 END), 2) AS expense
+      FROM transactions
+      WHERE created_at >= ? AND created_at < ? AND currency_code = ?
+      GROUP BY month
+      ORDER BY month ASC
+    `,
+    bounds.start,
+    bounds.end,
+    currencyCode
+  );
+  return rows.map((row) => {
+    const income = Number(row.income ?? 0);
+    const expense = Number(row.expense ?? 0);
+    return {
+      month: Number(row.month),
+      income,
+      expense,
+      balance: Number((income - expense).toFixed(2)),
+    };
+  });
+}
+
+export async function listAnnualCategoryTotals(referenceDate?: string, currencyCode = DEFAULT_CURRENCY_CODE): Promise<CategoryTotal[]> {
+  const db = await getDb();
+  const bounds = toYearBounds(referenceDate);
+  const rows = await db.getAllAsync<{ category: string; total: number }>(
+    `
+      SELECT category, ROUND(SUM(amount), 2) AS total
+      FROM transactions
+      WHERE type IN ('expense', 'transfer_out')
+        AND created_at >= ? AND created_at < ?
+        AND currency_code = ?
+      GROUP BY category
+      ORDER BY total DESC
+    `,
+    bounds.start,
+    bounds.end,
+    currencyCode
+  );
+  return rows.map((row) => ({
+    category: row.category || 'varios',
+    total: Number(row.total ?? 0),
+  }));
+}
+
+export async function listMonthlyCategoryTotals(referenceDate?: string, currencyCode = DEFAULT_CURRENCY_CODE): Promise<CategoryTotal[]> {
   const db = await getDb();
   const bounds = toMonthBounds(referenceDate);
 
@@ -344,11 +436,13 @@ export async function listMonthlyCategoryTotals(referenceDate?: string): Promise
       FROM transactions
       WHERE type IN ('expense', 'transfer_out')
         AND created_at >= ? AND created_at < ?
+        AND currency_code = ?
       GROUP BY category
       ORDER BY total DESC
     `,
     bounds.start,
-    bounds.end
+    bounds.end,
+    currencyCode
   );
 
   return rows.map((row) => ({
@@ -357,7 +451,7 @@ export async function listMonthlyCategoryTotals(referenceDate?: string): Promise
   }));
 }
 
-export async function listMonthlyAccountMovementTotals(referenceDate?: string): Promise<AccountMovementTotal[]> {
+export async function listMonthlyAccountMovementTotals(referenceDate?: string, currencyCode = DEFAULT_CURRENCY_CODE): Promise<AccountMovementTotal[]> {
   const db = await getDb();
   const bounds = toMonthBounds(referenceDate);
 
@@ -368,11 +462,13 @@ export async function listMonthlyAccountMovementTotals(referenceDate?: string): 
       WHERE created_at >= ? AND created_at < ?
         AND account_name IS NOT NULL
         AND TRIM(account_name) <> ''
+        AND currency_code = ?
       GROUP BY account_name
       ORDER BY total_movement DESC
     `,
     bounds.start,
-    bounds.end
+    bounds.end,
+    currencyCode
   );
 
   return rows.map((row) => ({

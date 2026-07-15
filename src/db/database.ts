@@ -1,7 +1,7 @@
 import { SQLiteDatabase, openDatabaseAsync } from 'expo-sqlite';
 
 const DB_NAME = 'myfinance.db';
-const SCHEMA_VERSION = 12;
+const SCHEMA_VERSION = 14;
 let dbInstance: SQLiteDatabase | null = null;
 
 async function hasColumn(db: SQLiteDatabase, tableName: string, columnName: string): Promise<boolean> {
@@ -407,6 +407,62 @@ async function migrateToV12(db: SQLiteDatabase): Promise<void> {
   `);
 }
 
+async function migrateToV13(db: SQLiteDatabase): Promise<void> {
+  const currencyTables = ['expenses', 'products', 'income_entries', 'transactions', 'account_movements', 'payables'] as const;
+  for (const tableName of currencyTables) {
+    if (!(await hasColumn(db, tableName, 'currency_code'))) {
+      await db.runAsync(`ALTER TABLE ${tableName} ADD COLUMN currency_code TEXT NOT NULL DEFAULT 'CRC'`);
+    }
+  }
+
+  // Historical records inherit the currency of their linked account when available.
+  for (const tableName of ['expenses', 'products', 'income_entries', 'transactions', 'account_movements'] as const) {
+    await db.execAsync(`
+      UPDATE ${tableName}
+      SET currency_code = COALESCE(
+        NULLIF((SELECT a.currency_code FROM accounts a WHERE a.name = ${tableName}.account_name ORDER BY a.id DESC LIMIT 1), ''),
+        NULLIF(currency_code, ''),
+        (SELECT value FROM app_meta WHERE key = 'default_currency_code'),
+        'CRC'
+      )
+    `);
+  }
+  await db.execAsync(`
+    UPDATE payables
+    SET currency_code = COALESCE(
+      NULLIF((SELECT value FROM app_meta WHERE key = 'default_currency_code'), ''),
+      'CRC'
+    )
+    WHERE currency_code IS NULL OR TRIM(currency_code) = '';
+
+    CREATE INDEX IF NOT EXISTS idx_transactions_currency_created_at ON transactions(currency_code, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_products_currency_created_at ON products(currency_code, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_expenses_currency_created_at ON expenses(currency_code, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_income_entries_currency_created_at ON income_entries(currency_code, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_payables_currency_due_day ON payables(currency_code, is_paid, due_day);
+  `);
+}
+
+async function migrateToV14(db: SQLiteDatabase): Promise<void> {
+  await db.execAsync(`
+    CREATE TABLE IF NOT EXISTS category_budgets (
+      category TEXT NOT NULL,
+      currency_code TEXT NOT NULL DEFAULT 'CRC',
+      amount REAL NOT NULL,
+      PRIMARY KEY (category, currency_code)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_category_budgets_currency ON category_budgets(currency_code, category);
+
+    INSERT OR IGNORE INTO category_budgets (category, currency_code, amount)
+    SELECT
+      category,
+      COALESCE(NULLIF((SELECT value FROM app_meta WHERE key = 'default_currency_code'), ''), 'CRC'),
+      amount
+    FROM budgets;
+  `);
+}
+
 type Migration = {
   version: number;
   run: (db: SQLiteDatabase) => Promise<void>;
@@ -424,6 +480,8 @@ const MIGRATIONS: Migration[] = [
   { version: 10, run: migrateToV10 },
   { version: 11, run: migrateToV11 },
   { version: 12, run: migrateToV12 },
+  { version: 13, run: migrateToV13 },
+  { version: 14, run: migrateToV14 },
 ];
 
 export async function getDb(): Promise<SQLiteDatabase> {

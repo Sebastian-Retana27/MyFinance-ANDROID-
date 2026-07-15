@@ -5,6 +5,7 @@ export type Transaction = {
   type: TransactionType;
   source: string;
   amount: number;
+  currencyCode: string;
   quantity: number;
   category: string;
   accountName: string;
@@ -15,6 +16,7 @@ export type Transaction = {
 
 export type MonthlyTransactionSummary = {
   monthKey: string;
+  currencyCode: string;
   totalExpense: number;
   totalIncome: number;
   net: number;
@@ -48,6 +50,13 @@ export type TransactionPageResult = {
 };
 
 export type MonthlyFinancialSummary = {
+  income: number;
+  expense: number;
+  balance: number;
+};
+
+export type AnnualMonthlySummary = {
+  month: number;
   income: number;
   expense: number;
   balance: number;

@@ -4,5 +4,6 @@ export type Expense = {
   quantity: number;
   amount: number;
   accountName: string;
+  currencyCode: string;
   createdAt: string;
 };

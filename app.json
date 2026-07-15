@@ -2,13 +2,13 @@
   "expo": {
     "name": "MyFinance",
     "slug": "MyFinance",
-    "version": "1.0.0",
+    "version": "1.0.10",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "automatic",
     "newArchEnabled": false,
     "splash": {
-      "image": "./assets/icon.png",
+      "image": "./assets/splash-icon.png",
       "resizeMode": "contain",
       "backgroundColor": "#191919"
     },
@@ -18,7 +18,7 @@
     "android": {
       "package": "com.caentertainment.myfinance",
       "adaptiveIcon": {
-        "foregroundImage": "./assets/icon.png",
+        "foregroundImage": "./assets/adaptive-icon.png",
         "backgroundColor": "#191919"
       },
       "edgeToEdgeEnabled": true,
@@ -33,7 +33,7 @@
         "expo-splash-screen",
         {
           "backgroundColor": "#191919",
-          "image": "./assets/icon.png",
+          "image": "./assets/splash-icon.png",
           "imageWidth": 220,
           "resizeMode": "contain"
         }
