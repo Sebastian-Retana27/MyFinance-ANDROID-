@@ -137,7 +137,7 @@ import {
 } from './src/i18n/localization';
 import { convertWithRate, getExchangeRate } from './src/services/exchangeRateService';
 
-const PRIVACY_POLICY_URL = 'https://sebastian-retana27.github.io/MyFinance-ANDROID-/privacy.html';
+const PRIVACY_POLICY_URL = 'https://codezerointeractive.com/privacy/myfinance';
 
 // Keep the native splash visible while local settings and SQLite initialize.
 void SplashScreen.preventAutoHideAsync().catch(() => undefined);
